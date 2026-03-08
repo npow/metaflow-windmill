@@ -77,13 +77,6 @@ jobs:
           pip install -e ".[dev]"
           pip install "metaflow>=2.9"
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Start Windmill server
         run: |
           docker run -d \
