@@ -76,6 +76,71 @@ class WindmillTriggeredRun(TriggeredRun):
             pass
         return None
 
+    def _resolve_run_id_from_windmill(self) -> Optional[str]:
+        """Query the Windmill API to find the actual Metaflow run_id.
+
+        The init module prints the RUN_ID as its last stdout line (the module result).
+        We find the init module's job and read its result to get the actual run_id.
+        """
+        try:
+            import requests
+
+            metadata = self._metadata
+            job_id = metadata.get("job_id")
+            if not job_id:
+                return None
+
+            additional_info = getattr(self.deployer, "additional_info", {}) or {}
+            windmill_host = additional_info.get("windmill_host", "http://localhost:8000")
+            windmill_token = additional_info.get("windmill_token", "")
+            windmill_workspace = additional_info.get("windmill_workspace", "admins")
+
+            session = requests.Session()
+            if windmill_token:
+                session.headers["Authorization"] = "Bearer %s" % windmill_token
+
+            # Get the flow job to find the init module job
+            job_url = "%s/api/w/%s/jobs_u/get/%s" % (
+                windmill_host, windmill_workspace, job_id
+            )
+            resp = session.get(job_url)
+            if resp.status_code != 200:
+                return None
+            job_data = resp.json()
+
+            # Find the metaflow_init module job
+            modules = job_data.get("flow_status", {}).get("modules", [])
+            init_job_id = None
+            for m in modules:
+                if m.get("id") == "metaflow_init" and m.get("job"):
+                    init_job_id = m["job"]
+                    break
+
+            if not init_job_id:
+                return None
+
+            # Get the init job result (last stdout line = the RUN_ID)
+            init_url = "%s/api/w/%s/jobs_u/get/%s" % (
+                windmill_host, windmill_workspace, init_job_id
+            )
+            resp = session.get(init_url)
+            if resp.status_code != 200:
+                return None
+            init_data = resp.json()
+
+            result = init_data.get("result", "")
+            if isinstance(result, str) and "windmill-" in result:
+                # The init module last line is e.g.:
+                # "Initialized Metaflow run: windmill-<uuid>" (from our echo)
+                # OR just "windmill-<uuid>" if the echo IS the last line
+                idx = result.rfind("windmill-")
+                run_id_candidate = result[idx:].strip()
+                if run_id_candidate.startswith("windmill-"):
+                    return run_id_candidate
+        except Exception:
+            pass
+        return None
+
     @property
     def run(self):
         """Retrieve the Run object, applying deployer env vars so local metadata works."""
@@ -102,8 +167,25 @@ class WindmillTriggeredRun(TriggeredRun):
                     pathspec = "%s/%s" % (flow_name, run_id)
                     self.pathspec = pathspec
 
-            return metaflow.Run(pathspec, _namespace_check=False)
-        except MetaflowNotFound:
+            # Try the direct pathspec first
+            try:
+                return metaflow.Run(pathspec, _namespace_check=False)
+            except MetaflowNotFound:
+                pass
+
+            # Pathspec not found - query Windmill to find the actual run_id
+            actual_run_id = self._resolve_run_id_from_windmill()
+            if actual_run_id:
+                flow_name = pathspec.split("/")[0]
+                if flow_name == "UNKNOWN":
+                    flow_name = _find_flow_for_run_id(actual_run_id) or "UNKNOWN"
+                new_pathspec = "%s/%s" % (flow_name, actual_run_id)
+                self.pathspec = new_pathspec
+                try:
+                    return metaflow.Run(new_pathspec, _namespace_check=False)
+                except MetaflowNotFound:
+                    pass
+
             return None
         finally:
             if old_meta is None:
@@ -223,7 +305,7 @@ class WindmillDeployedFlow(DeployedFlow):
 
     def _trigger_direct(self, **kwargs) -> "WindmillTriggeredRun":
         """Trigger a Windmill flow directly via REST API (no flow file needed)."""
-        import hashlib
+        import uuid
 
         additional_info = getattr(self.deployer, "additional_info", {}) or {}
         windmill_host = additional_info.get("windmill_host", "http://localhost:8000")
@@ -249,7 +331,11 @@ class WindmillDeployedFlow(DeployedFlow):
         url = "%s/api/w/%s/jobs/run/f/%s" % (
             windmill_host, windmill_workspace, flow_path
         )
+        # Pre-compute a stable run_id and pass it to the flow as METAFLOW_RUN_ID
+        # so the init module uses the exact same ID we record in the pathspec.
+        run_id = "windmill-" + str(uuid.uuid4()).replace("-", "")[:16]
         payload = {k: str(v) for k, v in kwargs.items()}
+        payload["METAFLOW_RUN_ID"] = run_id
         resp = session.post(url, json=payload)
         if resp.status_code not in (200, 201):
             raise RuntimeError(
@@ -258,7 +344,6 @@ class WindmillDeployedFlow(DeployedFlow):
             )
 
         job_id = resp.text.strip().strip('"')
-        run_id = "windmill-" + hashlib.md5(job_id.encode()).hexdigest()[:16]
 
         flow_class_name = (
             additional_info.get("mf_flow_class")

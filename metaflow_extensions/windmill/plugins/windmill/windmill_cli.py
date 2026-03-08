@@ -250,13 +250,12 @@ def trigger(
         % (flow_path, windmill_workspace),
         bold=True,
     )
-    job_id = _trigger_job(client, windmill_workspace, flow_path, inputs=params or None)
+    job_id, metaflow_run_id = _trigger_job(client, windmill_workspace, flow_path, inputs=params or None)
     job_url = "%s/run/%s?workspace=%s" % (windmill_host, job_id, windmill_workspace)
     obj.echo("Job started: *%s*" % job_url)
 
     if deployer_attribute_file:
-        run_id = "windmill-" + hashlib.md5(job_id.encode()).hexdigest()[:16]
-        pathspec = "%s/%s" % (obj.flow.name, run_id)
+        pathspec = "%s/%s" % (obj.flow.name, metaflow_run_id)
         with open(deployer_attribute_file, "w") as f:
             json.dump(
                 {
@@ -338,7 +337,7 @@ def run(
     _deploy_flow(client, windmill_workspace, flow_path, flow_json, obj)
 
     obj.echo("Triggering execution...", bold=True)
-    job_id = _trigger_job(client, windmill_workspace, flow_path)
+    job_id, _metaflow_run_id = _trigger_job(client, windmill_workspace, flow_path)
     job_url = "%s/run/%s?workspace=%s" % (windmill_host, job_id, windmill_workspace)
     obj.echo("Job started: *%s*" % job_url)
 
@@ -469,12 +468,24 @@ def _deploy_flow(
 
 def _trigger_job(
     client, workspace: str, flow_path: str, inputs: dict = None
-) -> str:
-    """Trigger a Windmill flow job and return the job ID."""
+) -> tuple:
+    """Trigger a Windmill flow job and return (job_id, metaflow_run_id).
+
+    We pre-compute the Metaflow run_id before triggering and pass it as
+    METAFLOW_RUN_ID flow input so the init module can use the same value.
+    This ensures the pathspec in the deployer matches the actual run in the
+    local datastore.
+    """
+    import uuid
+    # Pre-compute a stable run_id using a UUID
+    metaflow_run_id = "windmill-" + str(uuid.uuid4()).replace("-", "")[:16]
+
     host = client._windmill_host
     url = "%s/api/w/%s/jobs/run/f/%s" % (host, workspace, flow_path)
     try:
-        payload = inputs or {}
+        payload = dict(inputs or {})
+        # Pass the pre-computed run_id as a special flow input
+        payload["METAFLOW_RUN_ID"] = metaflow_run_id
         resp = client.post(url, json=payload)
         if resp.status_code not in (200, 201):
             raise WindmillException(
@@ -483,7 +494,7 @@ def _trigger_job(
             )
         # Windmill returns the job UUID as a plain quoted string
         job_id = resp.text.strip().strip('"')
-        return job_id
+        return job_id, metaflow_run_id
     except Exception as exc:
         if isinstance(exc, WindmillException):
             raise

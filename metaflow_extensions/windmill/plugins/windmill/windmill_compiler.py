@@ -92,7 +92,12 @@ class WindmillCompiler:
 
         self._metadata_type = metadata.TYPE
         self._datastore_type = flow_datastore.TYPE
-        self._datastore_root = getattr(flow_datastore, "datastore_root", None) or ""
+        # Capture the sysroot from the environment at compile time (deploy time).
+        # IMPORTANT: METAFLOW_DATASTORE_SYSROOT_LOCAL is the PARENT of .metaflow,
+        # not the full datastore_root. flow_datastore.datastore_root already has
+        # .metaflow appended, so we must use the env var directly.
+        # Using flow_datastore.datastore_root would cause double .metaflow nesting.
+        self._datastore_root = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "") or ""
         self._environment_type = environment.TYPE
         self._event_logger_type = event_logger.TYPE
         self._monitor_type = monitor.TYPE
@@ -196,7 +201,9 @@ class WindmillCompiler:
         modules = self._build_modules(params)
         flow_value = {
             "modules": modules,
-            "same_worker": False,
+            # same_worker=True forces all modules to run on the SAME worker process.
+            # This allows modules to share /tmp files (e.g. for passing the run ID).
+            "same_worker": True,
         }
         return {
             "summary": "Metaflow flow: %s" % self._flow_name,
@@ -245,6 +252,17 @@ class WindmillCompiler:
             "description": (
                 "Leave empty for a normal run. "
                 "Set to a previous Metaflow run ID to resume."
+            ),
+            "default": "",
+        }
+        # METAFLOW_RUN_ID is set by the deployer at trigger time to a pre-computed UUID.
+        # The init module uses this value as the Metaflow run ID, ensuring the pathspec
+        # in the deployer matches the actual run written to the local datastore.
+        properties["METAFLOW_RUN_ID"] = {
+            "type": "string",
+            "description": (
+                "Pre-computed Metaflow run ID set by the deployer. "
+                "Do not set manually."
             ),
             "default": "",
         }
@@ -327,8 +345,10 @@ class WindmillCompiler:
             "METAFLOW_DEFAULT_EVENT_LOGGER": self._event_logger_type,
             "METAFLOW_DEFAULT_MONITOR": self._monitor_type,
         }
-        if self._datastore_root:
-            env["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = self._datastore_root
+        # Always set sysroot - use compile-time value or env fallback
+        sysroot = self._datastore_root or os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")
+        if sysroot:
+            env["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
         if self._flow_config_value:
             # REQUIRED (Cap.CONFIG_EXPR): inject compile-time config values
             env["METAFLOW_FLOW_CONFIG_VALUE"] = self._flow_config_value
@@ -340,6 +360,24 @@ class WindmillCompiler:
                 key.startswith("METAFLOW_DEFAULT") and key not in env
             ):
                 env[key] = val
+        # Forward PYTHONPATH so Windmill workers can find metaflow source.
+        # When running locally, PYTHONPATH may contain the metaflow source path.
+        # We filter to only include paths that contain a 'metaflow' package
+        # (the OSS source) and exclude paths that would load NFLX-internal
+        # extensions that aren't available in the Windmill worker container.
+        current_pythonpath = os.environ.get("PYTHONPATH", "")
+        if current_pythonpath:
+            import sys
+            filtered_paths = []
+            for p in current_pythonpath.split(os.pathsep):
+                if not p:
+                    continue
+                # Include paths that contain the metaflow package itself
+                mf_pkg = os.path.join(p, "metaflow", "__init__.py")
+                if os.path.isfile(mf_pkg):
+                    filtered_paths.append(p)
+            if filtered_paths:
+                env["PYTHONPATH"] = os.pathsep.join(filtered_paths)
         return env
 
     def _env_export_lines(self) -> str:
@@ -354,7 +392,7 @@ class WindmillCompiler:
     def _step_cmd(self, step_name: str) -> str:
         """Build the base step command (without retry-count, run-id, task-id)."""
         parts = [
-            "python", self.flow_file,
+            "python3", self.flow_file,
             "--no-pylint",
             "--quiet",
             "--metadata", self._metadata_type,
@@ -365,14 +403,13 @@ class WindmillCompiler:
             "--monitor", self._monitor_type,
         ]
         if self._datastore_root:
-            parts += ["--datastore-root", self._datastore_root]
+            # The CLI --datastore-root expects the full path including .metaflow.
+            # _datastore_root is the SYSROOT (parent of .metaflow).
+            parts += ["--datastore-root", self._datastore_root + "/.metaflow"]
 
         # REQUIRED (Cap.PROJECT_BRANCH): --branch MUST be forwarded
         if self.branch:
             parts += ["--branch", self.branch]
-
-        for tag in self.tags:
-            parts += ["--tag", tag]
 
         if self.namespace:
             parts += ["--namespace", self.namespace]
@@ -380,7 +417,11 @@ class WindmillCompiler:
         for deco in self.with_decorators:
             parts += ["--with", deco]
 
+        # NOTE: --tag goes AFTER the 'step' subcommand (not as a top-level flag)
+        # in OSS Metaflow.
         parts += ["step", step_name]
+        for tag in self.tags:
+            parts += ["--tag", tag]
         return " ".join(parts)
 
     # ------------------------------------------------------------------
@@ -388,18 +429,14 @@ class WindmillCompiler:
     # ------------------------------------------------------------------
 
     def _build_init_module(self, params: Dict) -> dict:
-        """Build the init module that computes run_id and runs metaflow init."""
+        """Build the init module that computes mf_run_id and runs metaflow init."""
         param_collection = "\n".join(
             'MF_PARAM_%s="${%s:-}"' % (pname.upper(), pname)
             for pname in params
         )
-        run_param_args = " ".join(
-            '--run-param "%s=$MF_PARAM_%s"' % (pname, pname.upper())
-            for pname in params
-        )
 
         base_init_cmd = " ".join([
-            "python", self.flow_file,
+            "python3", self.flow_file,
             "--no-pylint",
             "--quiet",
             "--metadata", self._metadata_type,
@@ -409,18 +446,21 @@ class WindmillCompiler:
             "--monitor", self._monitor_type,
         ])
         if self._datastore_root:
-            base_init_cmd += " --datastore-root " + self._datastore_root
+            base_init_cmd += " --datastore-root " + self._datastore_root + "/.metaflow"
         if self.branch:
             base_init_cmd += " --branch " + self.branch
-        for tag in self.tags:
-            base_init_cmd += " --tag " + tag
         if self.namespace:
             base_init_cmd += " --namespace " + self.namespace
         for deco in self.with_decorators:
             base_init_cmd += " --with " + deco
-        base_init_cmd += " init --run-id $RUN_ID"
-        if run_param_args:
-            base_init_cmd += " " + run_param_args
+        # NOTE: --tag goes AFTER the 'init' subcommand (not as a top-level flag)
+        # in OSS Metaflow; the NFLX extension moves it to top-level.
+        # --task-id is required for 'init' in OSS Metaflow.
+        # Parameters are passed as METAFLOW_PARAMETER_* env vars to the start step,
+        # not via --run-param (which is a NFLX-only init option).
+        base_init_cmd += " init --run-id $RUN_ID --task-id 1"
+        for tag in self.tags:
+            base_init_cmd += " --tag " + tag
 
         env_exports = self._env_export_lines()
 
@@ -435,12 +475,18 @@ set -e
 {param_collection}
 ORIGIN_RUN_ID="${{ORIGIN_RUN_ID:-}}"
 
-# Derive a stable run ID from the Windmill job ID
-RUN_ID="windmill-${{WM_JOB_ID:-$(date +%s%N | md5sum | head -c 16)}}"
+# Use the pre-computed run ID passed as METAFLOW_RUN_ID flow input.
+# This ensures the pathspec in the deployer matches the actual Metaflow run.
+if [ -n "${{METAFLOW_RUN_ID:-}}" ]; then
+  RUN_ID="$METAFLOW_RUN_ID"
+else
+  # Fallback: derive from timestamp (should not normally reach here)
+  RUN_ID="windmill-$(date +%s%N | md5sum | head -c 16)"
+fi
 export RUN_ID
 
-# Store run ID for downstream steps to use
-echo "$RUN_ID" > /tmp/mf_windmill_run_id_${{WM_JOB_ID:-0}}.txt
+# Store run ID for downstream steps to use via /tmp (same_worker=True shares /tmp)
+echo "$RUN_ID" > /tmp/mf_windmill_run_id.txt
 
 # Initialize Metaflow run (creates _parameters artifact)
 if [ -n "$ORIGIN_RUN_ID" ]; then
@@ -468,10 +514,14 @@ echo "Initialized Metaflow run: $RUN_ID"
             "type": "javascript",
             "expr": "flow_input.ORIGIN_RUN_ID || ''",
         }
+        input_transforms["METAFLOW_RUN_ID"] = {
+            "type": "javascript",
+            "expr": "flow_input.METAFLOW_RUN_ID || ''",
+        }
 
         return {
             "id": "metaflow_init",
-            "summary": "Metaflow init (compute run_id, init parameters)",
+            "summary": "Metaflow init (compute mf_run_id, init parameters)",
             "value": {
                 "type": "rawscript",
                 "content": script,
@@ -485,6 +535,24 @@ echo "Initialized Metaflow run: $RUN_ID"
         env_exports = self._env_export_lines()
         step_base_cmd = self._step_cmd(node.name)
 
+        # Compute --input-paths for this step.
+        # In OSS Metaflow local storage:
+        #   start step input: $RUN_ID/_parameters/1  (from init)
+        #   other steps:      $RUN_ID/{parent_step}/1
+        #   join steps:       comma-separated list of $RUN_ID/{parent}/1 for each parent
+        in_funcs = list(node.in_funcs)
+        if node.name == "start":
+            input_paths_expr = '"$RUN_ID/_parameters/1"'
+        elif len(in_funcs) == 1:
+            parent = in_funcs[0]
+            input_paths_expr = '"$RUN_ID/%s/1"' % parent
+        else:
+            # Multiple parents (join step)
+            parent_paths = ",".join("$RUN_ID/%s/1" % p for p in in_funcs)
+            input_paths_expr = '"%s"' % parent_paths
+
+        # The RUN_ID is shared via /tmp file since same_worker=True ensures
+        # all modules run in the same worker process/container.
         script = '''\
 #!/bin/bash
 set -e
@@ -492,21 +560,24 @@ set -e
 # Set up Metaflow environment
 {env_exports}
 
-# Restore run ID from init step
-RUN_ID=$(cat /tmp/mf_windmill_run_id_${{WM_JOB_ID:-0}}.txt 2>/dev/null || echo "")
+# Restore run ID written by the metaflow_init module (same_worker=True shares /tmp)
+RUN_ID=$(cat /tmp/mf_windmill_run_id.txt 2>/dev/null || echo "")
 if [ -z "$RUN_ID" ]; then
-  echo "ERROR: RUN_ID not set. Init step may have failed."
+  echo "ERROR: RUN_ID not set. Init step may have failed or same_worker is not enabled."
   exit 1
 fi
 
 # REQUIRED (Cap.RETRY): retry_count from Windmill native attempt counter
 RETRY_COUNT="${{WM_FLOW_RETRY_COUNT:-0}}"
 
-{step_cmd} --run-id "$RUN_ID" --task-id 1 --retry-count "$RETRY_COUNT" {extra_args}
+INPUT_PATHS={input_paths_expr}
+
+{step_cmd} --run-id "$RUN_ID" --task-id 1 --retry-count "$RETRY_COUNT" --input-paths "$INPUT_PATHS" {extra_args}
 '''.format(
             env_exports=env_exports,
             step_cmd=step_base_cmd,
             extra_args=extra_args,
+            input_paths_expr=input_paths_expr,
         )
 
         retries, retry_delay = self._get_retry_config(node)
@@ -558,13 +629,25 @@ RETRY_COUNT="${{WM_FLOW_RETRY_COUNT:-0}}"
         step_base_cmd = self._step_cmd(body_name)
 
         # Body script: uses WM_ITERATION_INDEX for split-index
+        # RUN_ID is shared via /tmp file since same_worker=True.
+        # The foreach parent step is the input for the body step.
+        body_node = self.graph[body_name]
+        body_in_funcs = list(body_node.in_funcs)
+        if len(body_in_funcs) == 1:
+            body_input_paths_expr = '"$RUN_ID/%s/1"' % body_in_funcs[0]
+        else:
+            body_input_paths_expr = '"' + ",".join(
+                "$RUN_ID/%s/1" % p for p in body_in_funcs
+            ) + '"'
+
         body_script = '''\
 #!/bin/bash
 set -e
 
 {env_exports}
 
-RUN_ID=$(cat /tmp/mf_windmill_run_id_${{WM_JOB_ID:-0}}.txt 2>/dev/null || echo "")
+# Restore run ID from init module (same_worker=True shares /tmp)
+RUN_ID=$(cat /tmp/mf_windmill_run_id.txt 2>/dev/null || echo "")
 if [ -z "$RUN_ID" ]; then
   echo "ERROR: RUN_ID not set."
   exit 1
@@ -573,11 +656,13 @@ fi
 RETRY_COUNT="${{WM_FLOW_RETRY_COUNT:-0}}"
 # WM_ITERATION_INDEX is set by Windmill's forloopflow for each iteration
 SPLIT_INDEX="${{WM_ITERATION_INDEX:-0}}"
+INPUT_PATHS={body_input_paths_expr}
 
-{step_cmd} --run-id "$RUN_ID" --task-id 1 --retry-count "$RETRY_COUNT" --split-index "$SPLIT_INDEX"
+{step_cmd} --run-id "$RUN_ID" --task-id "$SPLIT_INDEX" --retry-count "$RETRY_COUNT" --split-index "$SPLIT_INDEX" --input-paths "$INPUT_PATHS"
 '''.format(
             env_exports=env_exports,
             step_cmd=step_base_cmd,
+            body_input_paths_expr=body_input_paths_expr,
         )
 
         body_module = {

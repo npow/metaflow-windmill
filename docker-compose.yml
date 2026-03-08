@@ -41,6 +41,11 @@ services:
       - db
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # Share the host filesystem so Metaflow step scripts can access:
+      # - the flow file (e.g. /Users/npow/code/metaflow/...)
+      # - the local datastore (e.g. /tmp/mf-windmill-test)
+      - /Users:/Users
+      - /tmp:/tmp
 
 volumes:
   db_data:
