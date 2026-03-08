@@ -206,7 +206,20 @@ class WindmillDeployedFlow(DeployedFlow):
             "Error triggering Windmill flow %r" % self.deployer.flow_file
         )
 
-    trigger = run
+    def trigger(self, run_params=None, **kwargs) -> "WindmillTriggeredRun":
+        """Trigger a new execution; alias for run() that also accepts run_params.
+
+        REQUIRED (Cap.RUN_PARAMS): run_params must be a list, not a tuple.
+        Click returns tuples for multi-value options; always convert:
+            run_params = list(run_params) if run_params else []
+        """
+        # REQUIRED (Cap.RUN_PARAMS): must be list, not tuple — DO NOT REMOVE
+        run_params = list(run_params) if run_params else []
+        # Unpack run_params (key=value strings) into kwargs for run()
+        for kv in run_params:
+            k, _, v = kv.partition("=")
+            kwargs.setdefault(k.strip(), v.strip())
+        return self.run(**kwargs)
 
     def _trigger_direct(self, **kwargs) -> "WindmillTriggeredRun":
         """Trigger a Windmill flow directly via REST API (no flow file needed)."""
