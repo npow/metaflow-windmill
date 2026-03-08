@@ -359,6 +359,8 @@ class WindmillCompiler:
             "--quiet",
             "--metadata", self._metadata_type,
             "--datastore", self._datastore_type,
+            # REQUIRED (Cap.ENVIRONMENT): --environment for @conda support
+            "--environment", self._environment_type,
             "--event-logger", self._event_logger_type,
             "--monitor", self._monitor_type,
         ]
@@ -402,6 +404,7 @@ class WindmillCompiler:
             "--quiet",
             "--metadata", self._metadata_type,
             "--datastore", self._datastore_type,
+            "--environment", self._environment_type,
             "--event-logger", self._event_logger_type,
             "--monitor", self._monitor_type,
         ])
