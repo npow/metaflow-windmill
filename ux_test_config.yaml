@@ -1,0 +1,25 @@
+# UX test configuration for metaflow-windmill
+#
+# Usage:
+#   1. Start Windmill: docker compose up -d
+#   2. Get your token from http://localhost:8000
+#   3. Update windmill_token below
+#   4. Run tests:
+#      METAFLOW_DEFAULT_METADATA=local METAFLOW_DEFAULT_DATASTORE=local \
+#      METAFLOW_DATASTORE_SYSROOT_LOCAL=/tmp/mf-windmill-test \
+#      PYTHONPATH=/path/to/metaflow:/path/to/metaflow-windmill \
+#      python -m pytest /path/to/metaflow/test/ux/core/test_basic.py \
+#        --ux-config=ux_test_config.yaml \
+#        --only-backend windmill \
+#        -v --tb=long
+
+backends:
+  - name: windmill
+    scheduler_type: windmill
+    cluster: null
+    decospec: null
+    deploy_args:
+      windmill_host: http://localhost:8000
+      windmill_token: ""  # Set your token here or use WINDMILL_TOKEN env var
+      windmill_workspace: admins
+    enabled: false  # Set to true after updating windmill_token
