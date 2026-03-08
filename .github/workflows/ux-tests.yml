@@ -1,0 +1,166 @@
+name: UX Tests
+
+on:
+  push:
+    branches:
+      - master
+      - "**"
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  # ------------------------------------------------------------------
+  # Unit tests (no Windmill server needed)
+  # ------------------------------------------------------------------
+  unit-tests:
+    name: "Unit tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]"
+          # Install metaflow from source if available, otherwise from PyPI
+          pip install "metaflow>=2.9"
+
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/ -v --tb=short --timeout=60
+
+  # ------------------------------------------------------------------
+  # Deployer tests (requires Windmill)
+  # ------------------------------------------------------------------
+  deployer-tests:
+    name: "Deployer tests — ${{ matrix.test }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - test: test_hello_world
+          - test: test_hello_project
+          - test: test_from_deployment
+
+    services:
+      db:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: windmill
+          POSTGRES_USER: windmill
+          POSTGRES_DB: windmill
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install "metaflow>=2.9"
+
+      - name: Start Windmill server
+        run: |
+          docker run -d \
+            --name windmill_server \
+            --network host \
+            -e DATABASE_URL="postgres://windmill:windmill@localhost:5432/windmill" \
+            -e BASE_URL="http://localhost:8000" \
+            -e MODE=server \
+            -p 8000:8000 \
+            ghcr.io/windmill-labs/windmill:main
+        continue-on-error: true
+
+      - name: Start Windmill worker
+        run: |
+          docker run -d \
+            --name windmill_worker \
+            --network host \
+            -e DATABASE_URL="postgres://windmill:windmill@localhost:5432/windmill" \
+            -e BASE_URL="http://localhost:8000" \
+            -e MODE=worker \
+            -e WORKER_GROUP=default \
+            ghcr.io/windmill-labs/windmill:main
+        continue-on-error: true
+
+      - name: Wait for Windmill to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/api/version > /dev/null 2>&1; then
+              echo "Windmill is ready"
+              break
+            fi
+            echo "Waiting for Windmill... ($i/30)"
+            sleep 5
+          done
+
+      - name: Get Windmill token
+        id: windmill_token
+        run: |
+          TOKEN=$(curl -s -X POST http://localhost:8000/api/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin@windmill.dev","password":"changeme"}' \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('token',''))")
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Set up Metaflow devstack (local metadata + datastore)
+        run: |
+          mkdir -p /tmp/mf-windmill-test
+
+          # Write ux_test_config.yaml for windmill backend
+          cat > /tmp/ux_test_config.yaml << EOF
+          backends:
+            - name: windmill
+              scheduler_type: windmill
+              cluster: null
+              decospec: null
+              deploy_args:
+                windmill_host: http://localhost:8000
+                windmill_token: "${{ steps.windmill_token.outputs.token }}"
+                windmill_workspace: admins
+              enabled: true
+          EOF
+
+      - name: Run deployer test — ${{ matrix.test }}
+        env:
+          METAFLOW_DEFAULT_METADATA: local
+          METAFLOW_DEFAULT_DATASTORE: local
+          METAFLOW_DATASTORE_SYSROOT_LOCAL: /tmp/mf-windmill-test
+          METAFLOW_PROFILE: ""
+          AWS_SHARED_CREDENTIALS_FILE: ""
+        run: |
+          python -m pytest \
+            test/ux/core/test_basic.py \
+            -k "${{ matrix.test }} and deployer" \
+            --ux-config=/tmp/ux_test_config.yaml \
+            --only-backend windmill \
+            --timeout=300 \
+            -v \
+            --tb=long
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-windmill-${{ matrix.test }}
+          path: coverage.xml
+          if-no-files-found: ignore
+          include-hidden-files: true

@@ -1,0 +1,46 @@
+version: "3.7"
+# Windmill local development docker-compose
+# Usage: docker compose up -d
+# Then get a token from http://localhost:8000 (admin@windmill.dev / changeme)
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: windmill
+      POSTGRES_USER: windmill
+      POSTGRES_DB: windmill
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"  # 5433 to avoid conflicts with local postgres
+
+  windmill_server:
+    image: ghcr.io/windmill-labs/windmill:main
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgres://windmill:windmill@db:5432/windmill
+      BASE_URL: "http://localhost:8000"
+      RUST_LOG: "info"
+      MODE: "server"
+    depends_on:
+      - db
+
+  windmill_worker:
+    image: ghcr.io/windmill-labs/windmill:main
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://windmill:windmill@db:5432/windmill
+      BASE_URL: "http://localhost:8000"
+      MODE: "worker"
+      WORKER_GROUP: "default"
+    depends_on:
+      - db
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  db_data:
