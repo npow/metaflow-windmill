@@ -2,6 +2,25 @@
 
 Registers TYPE = "windmill" so that Deployer(flow_file).windmill(...)
 is available and the Metaflow Deployer API can be used with Windmill.
+
+OrchestratorCapabilities contract — implemented in windmill_compiler.py:
+
+  Cap.CONFIG_EXPR    — METAFLOW_FLOW_CONFIG_VALUE is extracted at compile time
+                       from flow._flow_state[FlowStateItems.CONFIGS] and injected
+                       into every step subprocess via _build_env_dict().
+
+  Cap.PROJECT_BRANCH — '--branch' is forwarded to every step subprocess via
+                       _step_cmd() in WindmillCompiler.
+
+  Cap.RETRY          — retry_count is derived from WM_FLOW_RETRY_COUNT (Windmill
+                       native attempt counter) in every step bash script.
+                       str(retry_count) is passed via --retry-count.
+
+  Cap.DATASTORE      — METAFLOW_DATASTORE_SYSROOT_LOCAL is captured at deploy time
+                       and baked into every step env via _build_env_dict().
+
+  Cap.ENVIRONMENT    — '--environment' is passed to every step command so @conda
+                       flows use the correct Python interpreter.
 """
 
 from __future__ import annotations
