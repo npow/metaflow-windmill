@@ -57,6 +57,8 @@ jobs:
           POSTGRES_PASSWORD: windmill
           POSTGRES_USER: windmill
           POSTGRES_DB: windmill
+        ports:
+          - 5432:5432
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
