@@ -66,6 +66,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout metaflow source (for UX test infrastructure)
+        uses: actions/checkout@v4
+        with:
+          repository: Netflix/metaflow
+          ref: npow/corral-devstack
+          path: metaflow-src
+
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
@@ -75,7 +82,10 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e ".[dev]"
-          pip install "metaflow>=2.9"
+          # Install metaflow from the checked-out source so test infrastructure matches
+          pip install -e ./metaflow-src
+          # omegaconf is required by the UX test conftest
+          pip install omegaconf
 
       - name: Start Windmill server
         run: |
@@ -87,7 +97,6 @@ jobs:
             -e MODE=server \
             -p 8000:8000 \
             ghcr.io/windmill-labs/windmill:main
-        continue-on-error: true
 
       - name: Start Windmill worker
         run: |
@@ -99,34 +108,47 @@ jobs:
             -e MODE=worker \
             -e WORKER_GROUP=default \
             ghcr.io/windmill-labs/windmill:main
-        continue-on-error: true
 
       - name: Wait for Windmill to be ready
         run: |
-          for i in $(seq 1 30); do
+          for i in $(seq 1 36); do
             if curl -sf http://localhost:8000/api/version > /dev/null 2>&1; then
-              echo "Windmill is ready"
+              echo "Windmill HTTP is ready"
               break
             fi
-            echo "Waiting for Windmill... ($i/30)"
+            echo "Waiting for Windmill... ($i/36)"
             sleep 5
           done
 
       - name: Get Windmill token
         id: windmill_token
         run: |
-          TOKEN=$(curl -s -X POST http://localhost:8000/api/auth/login \
-            -H 'Content-Type: application/json' \
-            -d '{"username":"admin@windmill.dev","password":"changeme"}' \
-            | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('token',''))")
-          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          for i in $(seq 1 20); do
+            TOKEN=$(curl -s -X POST http://localhost:8000/api/auth/login \
+              -H 'Content-Type: application/json' \
+              -d '{"username":"admin@windmill.dev","password":"changeme"}' \
+              2>/dev/null)
+            if echo "$TOKEN" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['token'])" 2>/dev/null; then
+              TOKEN_VALUE=$(echo "$TOKEN" | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+              echo "token=$TOKEN_VALUE" >> $GITHUB_OUTPUT
+              echo "Windmill auth ready after $i attempt(s)"
+              break
+            fi
+            echo "Auth not ready yet ($i/20), waiting..."
+            sleep 5
+          done
+          if [ -z "$TOKEN_VALUE" ]; then
+            echo "ERROR: Failed to obtain Windmill token after 20 attempts"
+            exit 1
+          fi
 
       - name: Set up Metaflow devstack (local metadata + datastore)
         run: |
           mkdir -p /tmp/mf-windmill-test
 
-          # Write ux_test_config.yaml for windmill backend
-          cat > /tmp/ux_test_config.yaml << EOF
+          # Write the windmill backend into the UX test config that the
+          # conftest.py reads from test/ux/ux_test_config.yaml
+          cat > metaflow-src/test/ux/ux_test_config.yaml << EOF
           backends:
             - name: windmill
               scheduler_type: windmill
@@ -145,12 +167,16 @@ jobs:
           METAFLOW_DEFAULT_DATASTORE: local
           METAFLOW_DATASTORE_SYSROOT_LOCAL: /tmp/mf-windmill-test
           METAFLOW_PROFILE: ""
+          METAFLOW_HOME: /tmp/mf-windmill-test
           AWS_SHARED_CREDENTIALS_FILE: ""
+          # Prevent the devstack conftest from overriding our clean env
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          PYTHONPATH: ${{ github.workspace }}/metaflow-src
         run: |
           python -m pytest \
-            test/ux/core/test_basic.py \
+            metaflow-src/test/ux/core/test_basic.py \
             -k "${{ matrix.test }} and deployer" \
-            --ux-config=/tmp/ux_test_config.yaml \
             --only-backend windmill \
             --timeout=300 \
             -v \
