@@ -80,11 +80,18 @@ class WindmillTriggeredRun(TriggeredRun):
     # ------------------------------------------------------------------
 
     def _ensure_metadata(self):
-        """Configure local metadata provider to point at the deployer's sysroot."""
-        if self._metadata_configured:
-            return
-        self._metadata_configured = True
+        """Configure local metadata provider to point at the deployer's sysroot.
 
+        Called on every access to ``run`` / ``status``.  On the first call we
+        set environment variables permanently (they must stay set because
+        metaflow.Run() uses lazy evaluation — data reads happen later).
+
+        We also call ``metaflow.metadata("local@<sysroot>")`` which invokes
+        ``compute_info()`` and sets ``LocalStorage.datastore_root``.  This is
+        deferred until the ``.metaflow`` directory actually exists on disk to
+        avoid errors from ``compute_info()``.  Before that, the env vars alone
+        are enough for ``metaflow.Run()`` to locate the data.
+        """
         env_vars = getattr(self.deployer, "env_vars", {}) or {}
         sysroot = env_vars.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
         meta_type = env_vars.get("METAFLOW_DEFAULT_METADATA")
@@ -92,22 +99,24 @@ class WindmillTriggeredRun(TriggeredRun):
         if meta_type == "local" and not sysroot:
             sysroot = os.path.expanduser("~")
 
-        if sysroot:
-            os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
-        if meta_type:
-            os.environ["METAFLOW_DEFAULT_METADATA"] = meta_type
+        # Env vars — set once on the first call.
+        if not self._metadata_configured:
+            self._metadata_configured = True
+            if sysroot:
+                os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
+            if meta_type:
+                os.environ["METAFLOW_DEFAULT_METADATA"] = meta_type
+            if meta_type and meta_type != "local":
+                metaflow.metadata(meta_type)
+            metaflow.namespace(None)
 
-        # "local@path" calls compute_info() which sets LocalStorage.datastore_root.
+        # For the local provider we need to call metadata("local@<path>") to
+        # configure LocalStorage.datastore_root.  This only works once the
+        # .metaflow directory exists, so we retry on every call until it does.
         if sysroot and meta_type == "local":
             mf_dir = os.path.join(sysroot, ".metaflow")
             if os.path.isdir(mf_dir):
                 metaflow.metadata("local@%s" % sysroot)
-            else:
-                metaflow.metadata("local")
-        elif meta_type:
-            metaflow.metadata(meta_type)
-
-        metaflow.namespace(None)
 
     # ------------------------------------------------------------------
     # Pathspec correction — the flow name in the pathspec might not match
