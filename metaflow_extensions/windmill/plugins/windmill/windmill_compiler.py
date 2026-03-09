@@ -469,6 +469,11 @@ class WindmillCompiler:
 #!/bin/bash
 set -e
 
+# Bootstrap: install metaflow if not available in this worker's Python environment
+if ! python3 -c "import metaflow" 2>/dev/null; then
+    pip3 install --quiet "metaflow>=2.9" 2>/dev/null || pip install --quiet "metaflow>=2.9" 2>/dev/null
+fi
+
 # Set up Metaflow environment
 {env_exports}
 
@@ -557,6 +562,11 @@ echo "Initialized Metaflow run: $RUN_ID"
         script = '''\
 #!/bin/bash
 set -e
+
+# Bootstrap: install metaflow if not available in this worker's Python environment
+if ! python3 -c "import metaflow" 2>/dev/null; then
+    pip3 install --quiet "metaflow>=2.9" 2>/dev/null || pip install --quiet "metaflow>=2.9" 2>/dev/null
+fi
 
 # Set up Metaflow environment
 {env_exports}
@@ -690,6 +700,11 @@ INPUT_PATHS={input_paths_expr}
 #!/bin/bash
 set -e
 
+# Bootstrap: install metaflow if not available in this worker's Python environment
+if ! python3 -c "import metaflow" 2>/dev/null; then
+    pip3 install --quiet "metaflow>=2.9" 2>/dev/null || pip install --quiet "metaflow>=2.9" 2>/dev/null
+fi
+
 {env_exports}
 
 # Restore run ID from init module (same_worker=True shares /tmp)
@@ -821,6 +836,11 @@ INPUT_PATHS={body_input_paths_expr}
         script = '''\
 #!/bin/bash
 set -e
+
+# Bootstrap: install metaflow if not available in this worker's Python environment
+if ! python3 -c "import metaflow" 2>/dev/null; then
+    pip3 install --quiet "metaflow>=2.9" 2>/dev/null || pip install --quiet "metaflow>=2.9" 2>/dev/null
+fi
 
 # Set up Metaflow environment
 {env_exports}

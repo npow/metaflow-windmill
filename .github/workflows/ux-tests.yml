@@ -121,6 +121,16 @@ jobs:
             -e WORKER_GROUP=default \
             ghcr.io/windmill-labs/windmill:main
 
+      - name: Pre-install metaflow in Windmill worker container
+        run: |
+          # Wait for the worker container to start then pre-install metaflow
+          for i in $(seq 1 30); do
+            docker exec windmill_worker pip3 install -q -e "./metaflow-src" && \
+              echo "metaflow installed in worker container" && break
+            echo "Waiting for worker container ($i/30)..."
+            sleep 2
+          done
+
       - name: Wait for Windmill to be ready
         run: |
           READY=0
