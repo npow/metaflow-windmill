@@ -158,7 +158,13 @@ class WindmillTriggeredRun(TriggeredRun):
                 os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
             if meta_type:
                 os.environ["METAFLOW_DEFAULT_METADATA"] = meta_type
-                metaflow.metadata(meta_type)
+                # Use "local@path" form to call compute_info() which properly sets
+                # LocalStorage.datastore_root and verifies the .metaflow dir exists.
+                # This bypasses any class-level datastore_root caching issues.
+                if sysroot and meta_type == "local":
+                    metaflow.metadata("local@%s" % sysroot)
+                else:
+                    metaflow.metadata(meta_type)
 
             pathspec = self.pathspec
             if pathspec and pathspec.startswith("UNKNOWN/"):
@@ -167,15 +173,6 @@ class WindmillTriggeredRun(TriggeredRun):
                 if flow_name:
                     pathspec = "%s/%s" % (flow_name, run_id)
                     self.pathspec = pathspec
-
-            # Force-set LocalStorage.datastore_root to bypass class-level caching
-            # issue where a previous call may have set it to the wrong value.
-            if sysroot:
-                try:
-                    from metaflow.plugins.datastores.local_storage import LocalStorage
-                    LocalStorage.datastore_root = os.path.join(sysroot, ".metaflow")
-                except Exception:
-                    pass
 
             # Try the direct pathspec first
             try:
