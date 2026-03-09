@@ -175,7 +175,10 @@ class WindmillTriggeredRun(TriggeredRun):
     def _debug_run(self, run_obj, pathspec):
         """Print diagnostic info about the Run object for CI debugging."""
         import traceback
-        from metaflow.datastore.local_storage import LocalStorage
+        try:
+            from metaflow.plugins.datastores.local_storage import LocalStorage
+        except ImportError:
+            from metaflow.datastore.local_storage import LocalStorage
 
         sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")
         print("[DIAG] pathspec=%s" % pathspec, flush=True)
