@@ -414,6 +414,58 @@ class WindmillCompiler:
             parts += ["--tag", tag]
         return " ".join(parts)
 
+    def _input_paths_expr(self, node) -> str:
+        """Return a bash expression for --input-paths for a step node.
+
+        Task IDs use non-integer format (windmill-N) so that the local metadata
+        provider's register_task_id() calls _new_task() — creating the step-level
+        _meta/_self.json that metaflow.Run() needs to enumerate steps.
+        """
+        in_funcs = list(node.in_funcs)
+        if node.name == "start":
+            return '"$RUN_ID/_parameters/windmill-params"'
+        elif len(in_funcs) == 1:
+            return '"$RUN_ID/%s/windmill-1"' % in_funcs[0]
+        else:
+            paths = ",".join("$RUN_ID/%s/windmill-1" % p for p in in_funcs)
+            return '"%s"' % paths
+
+    def _apply_retry_and_timeout(self, module: dict, node) -> dict:
+        """Add retry and timeout config to a module dict if the node has them."""
+        retries, retry_delay = self._get_retry_config(node)
+        timeout = self._get_timeout(node)
+        if retries > 0:
+            module["retry"] = {
+                "constant": {"attempts": retries, "seconds": retry_delay},
+            }
+        if timeout:
+            module["timeout"] = timeout
+        return module
+
+    def _bootstrap_snippet(self) -> str:
+        """Return a bash snippet that installs metaflow if not already available.
+
+        Handles Windmill worker containers where system python3 may lack pip.
+        Uses --break-system-packages for PEP 668 compatibility (Ubuntu 22.04+).
+        """
+        return '''\
+# Bootstrap: install pip + metaflow if not importable.
+if ! python3 -c "import metaflow" 2>/dev/null; then
+    python3 -c "import pip" 2>/dev/null || (apt-get update -q 2>/dev/null; apt-get install -y -q python3-pip 2>/dev/null) || true
+    python3 -m pip install --break-system-packages --quiet "metaflow>=2.9" 2>&1 || \\
+    python3 -m pip install --quiet "metaflow>=2.9" 2>&1 || true
+fi'''
+
+    def _restore_run_id_snippet(self) -> str:
+        """Return a bash snippet that reads the run ID from the shared /tmp file."""
+        return '''\
+# Restore run ID written by the init module (same_worker=True shares /tmp)
+RUN_ID=$(cat /tmp/mf_windmill_run_id.txt 2>/dev/null || echo "")
+if [ -z "$RUN_ID" ]; then
+  echo "ERROR: RUN_ID not set. Init step may have failed or same_worker is not enabled."
+  exit 1
+fi'''
+
     # ------------------------------------------------------------------
     # Module renderers
     # ------------------------------------------------------------------
@@ -552,67 +604,28 @@ echo "Initialized Metaflow run: $RUN_ID"
         """Build a Windmill module for a single Metaflow step."""
         env_exports = self._env_export_lines()
         step_base_cmd = self._step_cmd(node.name)
+        input_paths_expr = self._input_paths_expr(node)
 
-        # Compute --input-paths for this step.
-        # In OSS Metaflow local storage:
-        #   start step input: $RUN_ID/_parameters/windmill-params  (from init)
-        #   other steps:      $RUN_ID/{parent_step}/windmill-1
-        #   join steps:       comma-separated list for each parent
-        #
-        # Task IDs use non-integer format (windmill-N) so that the local
-        # metadata provider's register_task_id() calls _new_task() which
-        # creates the step-level _meta/_self.json required by metaflow.Run().
-        in_funcs = list(node.in_funcs)
-        if node.name == "start":
-            input_paths_expr = '"$RUN_ID/_parameters/windmill-params"'
-        elif len(in_funcs) == 1:
-            parent = in_funcs[0]
-            input_paths_expr = '"$RUN_ID/%s/windmill-1"' % parent
-        else:
-            # Multiple parents (join step)
-            parent_paths = ",".join("$RUN_ID/%s/windmill-1" % p for p in in_funcs)
-            input_paths_expr = '"%s"' % parent_paths
-
-        # The RUN_ID is shared via /tmp file since same_worker=True ensures
-        # all modules run in the same worker process/container.
         script = '''\
 #!/bin/bash
 set -e
 
-# Set up Metaflow environment (set PYTHONPATH first so bootstrap check uses it)
 {env_exports}
+{bootstrap}
+{restore_run_id}
 
-# Bootstrap: install pip + metaflow if not importable.
-# System python3 in Windmill container may lack pip — install it first.
-# Use --break-system-packages for Ubuntu 22.04+ / Debian 12+ (PEP 668).
-if ! python3 -c "import metaflow" 2>/dev/null; then
-    python3 -c "import pip" 2>/dev/null || (apt-get update -q 2>/dev/null; apt-get install -y -q python3-pip 2>/dev/null) || true
-    python3 -m pip install --break-system-packages --quiet "metaflow>=2.9" 2>&1 || \
-    python3 -m pip install --quiet "metaflow>=2.9" 2>&1 || true
-fi
-
-# Restore run ID written by the metaflow_init module (same_worker=True shares /tmp)
-RUN_ID=$(cat /tmp/mf_windmill_run_id.txt 2>/dev/null || echo "")
-if [ -z "$RUN_ID" ]; then
-  echo "ERROR: RUN_ID not set. Init step may have failed or same_worker is not enabled."
-  exit 1
-fi
-
-# REQUIRED (Cap.RETRY): retry_count from Windmill native attempt counter
 RETRY_COUNT="${{WM_FLOW_RETRY_COUNT:-0}}"
-
 INPUT_PATHS={input_paths_expr}
 
 {step_cmd} --run-id "$RUN_ID" --task-id windmill-1 --retry-count "$RETRY_COUNT" --input-paths "$INPUT_PATHS" {extra_args}
 '''.format(
             env_exports=env_exports,
+            bootstrap=self._bootstrap_snippet(),
+            restore_run_id=self._restore_run_id_snippet(),
             step_cmd=step_base_cmd,
             extra_args=extra_args,
             input_paths_expr=input_paths_expr,
         )
-
-        retries, retry_delay = self._get_retry_config(node)
-        timeout = self._get_timeout(node)
 
         module = {
             "id": node.name,
@@ -624,19 +637,7 @@ INPUT_PATHS={input_paths_expr}
                 "input_transforms": {},
             },
         }
-
-        if retries > 0:
-            module["retry"] = {
-                "constant": {
-                    "attempts": retries,
-                    "seconds": retry_delay,
-                },
-            }
-
-        if timeout:
-            module["timeout"] = timeout
-
-        return module
+        return self._apply_retry_and_timeout(module, node)
 
     def _build_foreach_body_modules(self, foreach_node, visited: set) -> list:
         """Build the list of modules for the body of a forloopflow.
@@ -718,20 +719,9 @@ INPUT_PATHS={input_paths_expr}
 #!/bin/bash
 set -e
 
-# Bootstrap: install metaflow using python3's own pip to ensure same Python
-# Use python3 -m pip (not pip3) to avoid version mismatch between pip3 and python3
-if ! python3 -c "import metaflow" 2>/dev/null; then
-    python3 -m pip install --quiet "metaflow>=2.9" 2>&1 || true
-fi
-
 {env_exports}
-
-# Restore run ID from init module (same_worker=True shares /tmp)
-RUN_ID=$(cat /tmp/mf_windmill_run_id.txt 2>/dev/null || echo "")
-if [ -z "$RUN_ID" ]; then
-  echo "ERROR: RUN_ID not set."
-  exit 1
-fi
+{bootstrap}
+{restore_run_id}
 
 RETRY_COUNT="${{WM_FLOW_RETRY_COUNT:-0}}"
 # WM_ITERATION_INDEX is set by Windmill's forloopflow for each iteration
@@ -741,6 +731,8 @@ INPUT_PATHS={body_input_paths_expr}
 {step_cmd} --run-id "$RUN_ID" --task-id "windmill-$SPLIT_INDEX" --retry-count "$RETRY_COUNT" --split-index "$SPLIT_INDEX" --input-paths "$INPUT_PATHS"
 '''.format(
             env_exports=env_exports,
+            bootstrap=self._bootstrap_snippet(),
+            restore_run_id=self._restore_run_id_snippet(),
             step_cmd=step_base_cmd,
             body_input_paths_expr=body_input_paths_expr,
         )
@@ -819,16 +811,7 @@ INPUT_PATHS={body_input_paths_expr}
         """
         env_exports = self._env_export_lines()
         step_base_cmd = self._step_cmd(node.name)
-
-        in_funcs = list(node.in_funcs)
-        if node.name == "start":
-            input_paths_expr = '"$RUN_ID/_parameters/windmill-params"'
-        elif len(in_funcs) == 1:
-            parent = in_funcs[0]
-            input_paths_expr = '"$RUN_ID/%s/windmill-1"' % parent
-        else:
-            parent_paths = ",".join("$RUN_ID/%s/windmill-1" % p for p in in_funcs)
-            input_paths_expr = '"%s"' % parent_paths
+        input_paths_expr = self._input_paths_expr(node)
 
         # After the step runs, read the _transition artifact to find the chosen branch.
         # _transition is stored as a pickled Python tuple ([step_name], None).
@@ -856,28 +839,11 @@ INPUT_PATHS={body_input_paths_expr}
 #!/bin/bash
 set -e
 
-# Set up Metaflow environment (set PYTHONPATH first so bootstrap check uses it)
 {env_exports}
+{bootstrap}
+{restore_run_id}
 
-# Bootstrap: install pip + metaflow if not importable.
-# System python3 in Windmill container may lack pip — install it first.
-# Use --break-system-packages for Ubuntu 22.04+ / Debian 12+ (PEP 668).
-if ! python3 -c "import metaflow" 2>/dev/null; then
-    python3 -c "import pip" 2>/dev/null || (apt-get update -q 2>/dev/null; apt-get install -y -q python3-pip 2>/dev/null) || true
-    python3 -m pip install --break-system-packages --quiet "metaflow>=2.9" 2>&1 || \
-    python3 -m pip install --quiet "metaflow>=2.9" 2>&1 || true
-fi
-
-# Restore run ID written by the metaflow_init module (same_worker=True shares /tmp)
-RUN_ID=$(cat /tmp/mf_windmill_run_id.txt 2>/dev/null || echo "")
-if [ -z "$RUN_ID" ]; then
-  echo "ERROR: RUN_ID not set. Init step may have failed or same_worker is not enabled."
-  exit 1
-fi
-
-# REQUIRED (Cap.RETRY): retry_count from Windmill native attempt counter
 RETRY_COUNT="${{WM_FLOW_RETRY_COUNT:-0}}"
-
 INPUT_PATHS={input_paths_expr}
 
 {step_cmd} --run-id "$RUN_ID" --task-id windmill-1 --retry-count "$RETRY_COUNT" --input-paths "$INPUT_PATHS"
@@ -887,13 +853,12 @@ INPUT_PATHS={input_paths_expr}
 python3 -c "{read_transition_py}"
 '''.format(
             env_exports=env_exports,
+            bootstrap=self._bootstrap_snippet(),
+            restore_run_id=self._restore_run_id_snippet(),
             step_cmd=step_base_cmd,
             input_paths_expr=input_paths_expr,
             read_transition_py=read_transition_py,
         )
-
-        retries, retry_delay = self._get_retry_config(node)
-        timeout = self._get_timeout(node)
 
         module = {
             "id": node.name,
@@ -905,19 +870,7 @@ python3 -c "{read_transition_py}"
                 "input_transforms": {},
             },
         }
-
-        if retries > 0:
-            module["retry"] = {
-                "constant": {
-                    "attempts": retries,
-                    "seconds": retry_delay,
-                },
-            }
-
-        if timeout:
-            module["timeout"] = timeout
-
-        return module
+        return self._apply_retry_and_timeout(module, node)
 
     def _build_branchone_module(self, switch_node, visited: set) -> dict:
         """Build a Windmill branchone module for a Metaflow split-switch node.

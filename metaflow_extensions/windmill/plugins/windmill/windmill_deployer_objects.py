@@ -1,11 +1,27 @@
-"""DeployedFlow and TriggeredRun objects for the Windmill Deployer plugin."""
+"""DeployedFlow and TriggeredRun objects for the Windmill Deployer plugin.
+
+WindmillDeployedFlow handles deploying and triggering Windmill flows.
+WindmillTriggeredRun tracks a running Windmill job and bridges it back
+to the Metaflow client (metaflow.Run) so callers can check status/results.
+
+Key design decisions:
+  - Environment variables for metadata/datastore are set permanently (not
+    saved/restored) because metaflow.Run() uses lazy evaluation — reads
+    happen later when the caller accesses run.finished or run.successful.
+  - Task IDs use non-integer format (windmill-N) so that the local metadata
+    provider's register_task_id() calls _new_task(), which creates the
+    step-level _meta/_self.json required by metaflow.Run().
+  - The Metaflow run_id is pre-computed by the deployer and passed to the
+    Windmill flow as METAFLOW_RUN_ID, so the deployer's pathspec matches
+    the actual run in the local datastore.
+"""
 
 from __future__ import annotations
 
 import json
 import os
 import sys
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import ClassVar, Optional
 
 import metaflow
 from metaflow.exception import MetaflowNotFound
@@ -13,12 +29,9 @@ from metaflow.runner.deployer import DeployedFlow, TriggeredRun
 from metaflow.runner.utils import get_lower_level_group, handle_timeout, temporary_fifo
 from metaflow.runner.subprocess_manager import SubprocessManager
 
-if TYPE_CHECKING:
-    import metaflow.runner.deployer_impl
-
 
 def _find_flow_for_run_id(sysroot: str, run_id: str) -> Optional[str]:
-    """Scan the local datastore to find which flow owns *run_id*."""
+    """Scan ``<sysroot>/.metaflow/*/`` to find which flow directory contains *run_id*."""
     mf_root = os.path.join(sysroot, ".metaflow")
     if not os.path.isdir(mf_root):
         return None
@@ -29,7 +42,12 @@ def _find_flow_for_run_id(sysroot: str, run_id: str) -> Optional[str]:
 
 
 def _make_stub_deployer(name: str):
-    """Return a minimal deployer stub for recovery without a flow file."""
+    """Create a minimal WindmillDeployer without running __init__.
+
+    Used by ``from_deployment()`` when recovering a deployed flow from an
+    identifier string (no flow file available).  Sets the subset of attributes
+    that WindmillDeployedFlow.run() and _trigger_direct() need.
+    """
     from .windmill_deployer import WindmillDeployer
 
     stub = object.__new__(WindmillDeployer)
@@ -69,28 +87,23 @@ class WindmillTriggeredRun(TriggeredRun):
         return self._metadata.get("job_url")
 
     # ------------------------------------------------------------------
-    # Metadata setup — called once, sets env vars permanently.
-    #
-    # The key insight: metaflow.Run() uses lazy evaluation. When the
-    # caller accesses run.finished or run.successful, the Metaflow client
-    # reads data from the local datastore at that moment. If we
-    # save/restore env vars around Run() creation, the lazy reads happen
-    # after restore — with the WRONG datastore path. So we set the env
-    # vars once and leave them set.
+    # Metadata setup
     # ------------------------------------------------------------------
 
     def _ensure_metadata(self):
-        """Configure local metadata provider to point at the deployer's sysroot.
+        """Configure local metadata/datastore so metaflow.Run() can find data.
 
-        Called on every access to ``run`` / ``status``.  On the first call we
-        set environment variables permanently (they must stay set because
-        metaflow.Run() uses lazy evaluation — data reads happen later).
+        Called on every access to ``run`` / ``status``.
 
-        We also call ``metaflow.metadata("local@<sysroot>")`` which invokes
-        ``compute_info()`` and sets ``LocalStorage.datastore_root``.  This is
-        deferred until the ``.metaflow`` directory actually exists on disk to
-        avoid errors from ``compute_info()``.  Before that, the env vars alone
-        are enough for ``metaflow.Run()`` to locate the data.
+        First call: sets METAFLOW_DATASTORE_SYSROOT_LOCAL and
+        METAFLOW_DEFAULT_METADATA as *permanent* env vars.  They must stay
+        set because metaflow.Run() is lazy — actual datastore reads happen
+        later (e.g. when the caller checks ``run.finished``).
+
+        Every call: if sysroot/.metaflow exists, calls
+        ``metaflow.metadata("local@<sysroot>")`` to set
+        ``LocalStorage.datastore_root`` (deferred until the directory appears
+        because ``compute_info()`` would fail without it).
         """
         env_vars = getattr(self.deployer, "env_vars", {}) or {}
         sysroot = env_vars.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
@@ -118,13 +131,13 @@ class WindmillTriggeredRun(TriggeredRun):
             if os.path.isdir(mf_dir):
                 metaflow.metadata("local@%s" % sysroot)
 
-    # ------------------------------------------------------------------
-    # Pathspec correction — the flow name in the pathspec might not match
-    # the actual directory in the datastore (e.g. UNKNOWN/run_id).
-    # ------------------------------------------------------------------
-
     def _resolve_pathspec(self) -> Optional[str]:
-        """Return a corrected pathspec, or None if the run doesn't exist yet."""
+        """Return a corrected pathspec, or None if the run directory doesn't exist.
+
+        The flow name in the pathspec may not match the actual datastore
+        directory (e.g. "UNKNOWN" from _trigger_direct).  If the expected
+        path doesn't exist, scans the sysroot to find the real flow name.
+        """
         pathspec = self.pathspec
         if not pathspec or "/" not in pathspec:
             return None
@@ -148,78 +161,25 @@ class WindmillTriggeredRun(TriggeredRun):
 
         return pathspec
 
-    # ------------------------------------------------------------------
-    # The run property — simple: configure metadata, resolve pathspec,
-    # create Run. No save/restore, no subprocess fallback, no Windmill
-    # API fallback.
-    # ------------------------------------------------------------------
-
     @property
     def run(self):
-        """Retrieve the metaflow.Run object for this triggered run."""
+        """Return a ``metaflow.Run`` for this triggered run, or None if not ready."""
         self._ensure_metadata()
         pathspec = self._resolve_pathspec()
         if not pathspec:
             return None
         try:
-            run_obj = metaflow.Run(pathspec, _namespace_check=False)
+            return metaflow.Run(pathspec, _namespace_check=False)
         except MetaflowNotFound:
             return None
 
-        # Diagnostic logging (temporary — remove after CI passes)
-        if os.environ.get("METAFLOW_WINDMILL_DEBUG"):
-            self._debug_run(run_obj, pathspec)
-
-        return run_obj
-
-    def _debug_run(self, run_obj, pathspec):
-        """Print diagnostic info about the Run object for CI debugging."""
-        import traceback
-        try:
-            from metaflow.plugins.datastores.local_storage import LocalStorage
-        except ImportError:
-            from metaflow.datastore.local_storage import LocalStorage
-
-        sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")
-        print("[DIAG] pathspec=%s" % pathspec, flush=True)
-        print("[DIAG] LocalStorage.datastore_root=%s" % LocalStorage.datastore_root, flush=True)
-        print("[DIAG] METAFLOW_DATASTORE_SYSROOT_LOCAL=%s" % sysroot, flush=True)
-
-        # Check if the end step dir exists on disk
-        flow_name, run_id = pathspec.split("/", 1)
-        end_dir = os.path.join(sysroot, ".metaflow", flow_name, run_id, "end")
-        print("[DIAG] end_dir=%s exists=%s" % (end_dir, os.path.isdir(end_dir)), flush=True)
-        if os.path.isdir(end_dir):
-            for root, dirs, files in os.walk(end_dir):
-                for f in files:
-                    print("[DIAG]   %s" % os.path.join(root, f), flush=True)
-
-        # Try accessing the chain that run.finished uses
-        try:
-            end_step = run_obj["end"]
-            print("[DIAG] run['end']=%s" % end_step, flush=True)
-            end_task = end_step.task
-            print("[DIAG] end_step.task=%s" % end_task, flush=True)
-            finished = end_task.finished
-            print("[DIAG] end_task.finished=%s" % finished, flush=True)
-            try:
-                task_ok = end_task["_task_ok"]
-                print("[DIAG] _task_ok=%s data=%s" % (task_ok, task_ok.data), flush=True)
-            except KeyError as e:
-                print("[DIAG] _task_ok KeyError: %s" % e, flush=True)
-        except Exception as e:
-            print("[DIAG] chain error: %s: %s" % (type(e).__name__, e), flush=True)
-            traceback.print_exc()
-
-    # ------------------------------------------------------------------
-    # Filesystem-based completion check. Used as fallback in status when
-    # metaflow.Run() isn't available yet (data hasn't landed).
-    # ------------------------------------------------------------------
-
     def _check_sysroot_completion(self) -> Optional[str]:
-        """Check the local datastore directly for run completion."""
-        import glob
+        """Check the local datastore directly for completion (fallback).
 
+        Used when ``metaflow.Run()`` returns None (data hasn't landed yet).
+        Looks for the ``_task_ok`` artifact in the ``end`` step directory
+        as evidence that the flow finished successfully.
+        """
         sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")
         if not sysroot:
             return None
@@ -233,13 +193,20 @@ class WindmillTriggeredRun(TriggeredRun):
         if not os.path.isdir(run_dir):
             return None
 
-        # Check if end step completed
-        for pattern in [
-            os.path.join(run_dir, "end", "*", "0.DONE.lock"),
-            os.path.join(run_dir, "end", "*", "0.task_end"),
-            os.path.join(run_dir, "end", "*", "_meta", "0_artifact__task_ok.json"),
-        ]:
-            if glob.glob(pattern):
+        # Look for completion markers in end/<task_id>/
+        end_dir = os.path.join(run_dir, "end")
+        if not os.path.isdir(end_dir):
+            return "RUNNING"
+        for task_dir in os.listdir(end_dir):
+            task_path = os.path.join(end_dir, task_dir)
+            if not os.path.isdir(task_path):
+                continue
+            # Any of these files indicate the end step completed
+            for marker in ("0.DONE.lock", "0.task_end"):
+                if os.path.exists(os.path.join(task_path, marker)):
+                    return "SUCCEEDED"
+            meta_marker = os.path.join(task_path, "_meta", "0_artifact__task_ok.json")
+            if os.path.exists(meta_marker):
                 return "SUCCEEDED"
 
         return "RUNNING"

@@ -235,7 +235,6 @@ jobs:
             "AWS_ACCESS_KEY_ID=" \
             "AWS_SECRET_ACCESS_KEY=" \
             "PYTHONPATH=${{ github.workspace }}/metaflow-src" \
-            "METAFLOW_WINDMILL_DEBUG=1" \
             "WINDMILL_HOST=http://localhost:8000" \
             "WINDMILL_TOKEN=${{ steps.windmill_token.outputs.token }}" \
             "WINDMILL_WORKSPACE=admins" \
