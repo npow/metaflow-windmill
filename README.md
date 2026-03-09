@@ -3,7 +3,7 @@
 [![CI](https://github.com/npow/metaflow-windmill/actions/workflows/ux-tests.yml/badge.svg)](https://github.com/npow/metaflow-windmill/actions/workflows/ux-tests.yml)
 [![PyPI](https://img.shields.io/pypi/v/metaflow-windmill)](https://pypi.org/project/metaflow-windmill/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Python](https://img.shields.io/pypi/pyversions/metaflow-windmill)](https://pypi.org/project/metaflow-windmill/)
+[![Python](https://img.shields.io/pypi/pyversions/metaflow-windmill)](https://pypi.org/project/metaflow-windmill/) [![Docs](https://img.shields.io/badge/docs-mintlify-18a34a?style=flat-square)](https://mintlify.com/npow/metaflow-windmill)
 
 Run any Metaflow flow on Windmill without rewriting your pipeline.
 
