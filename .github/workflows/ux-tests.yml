@@ -123,13 +123,21 @@ jobs:
 
       - name: Pre-install metaflow in Windmill worker container
         run: |
-          # Wait for the worker container to start then pre-install metaflow
+          # Install metaflow from source in the worker container.
+          # IMPORTANT: must use absolute path (not "./metaflow-src") because
+          # docker exec runs relative to the container's CWD, not the host CWD.
+          MF_SRC="${{ github.workspace }}/metaflow-src"
           for i in $(seq 1 30); do
-            docker exec windmill_worker pip3 install -q -e "./metaflow-src" && \
-              echo "metaflow installed in worker container" && break
+            if docker exec windmill_worker pip3 install -q -e "$MF_SRC" 2>&1; then
+              echo "metaflow installed in worker container from $MF_SRC"
+              break
+            fi
             echo "Waiting for worker container ($i/30)..."
             sleep 2
           done
+          # Verify installation
+          docker exec windmill_worker python3 -c "import metaflow; print('metaflow', metaflow.__version__)" || \
+            echo "WARNING: metaflow import failed in worker container"
 
       - name: Wait for Windmill to be ready
         run: |
@@ -212,6 +220,16 @@ jobs:
             --timeout=300 \
             -v \
             --tb=long
+
+      - name: Dump Windmill worker logs (on failure)
+        if: failure()
+        run: |
+          echo "=== Windmill worker logs ==="
+          docker logs --tail=100 windmill_worker 2>&1 || echo "(no worker logs)"
+          echo "=== Windmill server logs ==="
+          docker logs --tail=50 windmill_server 2>&1 || echo "(no server logs)"
+          echo "=== Metaflow sysroot contents ==="
+          ls -la /tmp/mf-windmill-test/ 2>/dev/null || echo "(sysroot empty)"
 
       - name: Upload coverage
         if: always()
