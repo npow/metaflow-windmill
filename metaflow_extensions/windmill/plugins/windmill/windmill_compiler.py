@@ -568,10 +568,10 @@ set -e
 # Set up Metaflow environment (set PYTHONPATH first so bootstrap check uses it)
 {env_exports}
 
-# Bootstrap: install metaflow using python3's own pip to ensure same Python.
-# python3 -m pip (not pip3) avoids version mismatch. PYTHONPATH set above may
-# already make metaflow importable from source without needing to install.
+# Bootstrap: install metaflow deps if not importable (PYTHONPATH may already work).
+# Use --break-system-packages for Debian 12+/Ubuntu 22.04+ (PEP 668 protection).
 if ! python3 -c "import metaflow" 2>/dev/null; then
+    python3 -m pip install --break-system-packages --quiet "metaflow>=2.9" 2>&1 || \
     python3 -m pip install --quiet "metaflow>=2.9" 2>&1 || true
 fi
 
@@ -845,10 +845,10 @@ set -e
 # Set up Metaflow environment (set PYTHONPATH first so bootstrap check uses it)
 {env_exports}
 
-# Bootstrap: install metaflow using python3's own pip to ensure same Python.
-# python3 -m pip (not pip3) avoids version mismatch. PYTHONPATH set above may
-# already make metaflow importable from source without needing to install.
+# Bootstrap: install metaflow deps if not importable (PYTHONPATH may already work).
+# Use --break-system-packages for Debian 12+/Ubuntu 22.04+ (PEP 668 protection).
 if ! python3 -c "import metaflow" 2>/dev/null; then
+    python3 -m pip install --break-system-packages --quiet "metaflow>=2.9" 2>&1 || \
     python3 -m pip install --quiet "metaflow>=2.9" 2>&1 || true
 fi
 

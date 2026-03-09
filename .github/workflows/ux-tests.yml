@@ -123,12 +123,15 @@ jobs:
 
       - name: Pre-install metaflow in Windmill worker container
         run: |
-          # Install metaflow from source in the worker container.
-          # IMPORTANT: must use absolute path (not "./metaflow-src") because
-          # docker exec runs relative to the container's CWD, not the host CWD.
+          # Install metaflow + deps in the worker container so step scripts can import it.
+          # Newer Debian/Ubuntu (22.04+, PEP 668) prevents system-wide pip installs
+          # without --break-system-packages. Use it explicitly.
           MF_SRC="${{ github.workspace }}/metaflow-src"
           for i in $(seq 1 30); do
-            if docker exec windmill_worker python3 -m pip install -q -e "$MF_SRC" 2>&1; then
+            if docker exec windmill_worker sh -c "
+              python3 -m pip install --break-system-packages -q -e '$MF_SRC' 2>&1 || \
+              python3 -m pip install -q -e '$MF_SRC' 2>&1
+            "; then
               echo "metaflow installed in worker container from $MF_SRC"
               break
             fi
@@ -137,7 +140,7 @@ jobs:
           done
           # Verify installation
           docker exec windmill_worker python3 -c "import metaflow; print('metaflow', metaflow.__version__)" || \
-            echo "WARNING: metaflow import failed in worker container"
+            echo "WARNING: metaflow import failed in worker container (will use PYTHONPATH fallback in scripts)"
 
       - name: Wait for Windmill to be ready
         run: |
