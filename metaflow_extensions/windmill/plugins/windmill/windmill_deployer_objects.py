@@ -162,9 +162,51 @@ class WindmillTriggeredRun(TriggeredRun):
         if not pathspec:
             return None
         try:
-            return metaflow.Run(pathspec, _namespace_check=False)
+            run_obj = metaflow.Run(pathspec, _namespace_check=False)
         except MetaflowNotFound:
             return None
+
+        # Diagnostic logging (temporary — remove after CI passes)
+        if os.environ.get("METAFLOW_WINDMILL_DEBUG"):
+            self._debug_run(run_obj, pathspec)
+
+        return run_obj
+
+    def _debug_run(self, run_obj, pathspec):
+        """Print diagnostic info about the Run object for CI debugging."""
+        import traceback
+        from metaflow.datastore.local_storage import LocalStorage
+
+        sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")
+        print("[DIAG] pathspec=%s" % pathspec, flush=True)
+        print("[DIAG] LocalStorage.datastore_root=%s" % LocalStorage.datastore_root, flush=True)
+        print("[DIAG] METAFLOW_DATASTORE_SYSROOT_LOCAL=%s" % sysroot, flush=True)
+
+        # Check if the end step dir exists on disk
+        flow_name, run_id = pathspec.split("/", 1)
+        end_dir = os.path.join(sysroot, ".metaflow", flow_name, run_id, "end")
+        print("[DIAG] end_dir=%s exists=%s" % (end_dir, os.path.isdir(end_dir)), flush=True)
+        if os.path.isdir(end_dir):
+            for root, dirs, files in os.walk(end_dir):
+                for f in files:
+                    print("[DIAG]   %s" % os.path.join(root, f), flush=True)
+
+        # Try accessing the chain that run.finished uses
+        try:
+            end_step = run_obj["end"]
+            print("[DIAG] run['end']=%s" % end_step, flush=True)
+            end_task = end_step.task
+            print("[DIAG] end_step.task=%s" % end_task, flush=True)
+            finished = end_task.finished
+            print("[DIAG] end_task.finished=%s" % finished, flush=True)
+            try:
+                task_ok = end_task["_task_ok"]
+                print("[DIAG] _task_ok=%s data=%s" % (task_ok, task_ok.data), flush=True)
+            except KeyError as e:
+                print("[DIAG] _task_ok KeyError: %s" % e, flush=True)
+        except Exception as e:
+            print("[DIAG] chain error: %s: %s" % (type(e).__name__, e), flush=True)
+            traceback.print_exc()
 
     # ------------------------------------------------------------------
     # Filesystem-based completion check. Used as fallback in status when
