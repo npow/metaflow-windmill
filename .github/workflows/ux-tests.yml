@@ -108,9 +108,13 @@ jobs:
 
       - name: Start Windmill worker
         run: |
+          # Pitfall #9: Docker workers cannot reach host filesystem.
+          # Mount workspace (for flow file path) and /tmp (for sysroot).
           docker run -d \
             --name windmill_worker \
             --network host \
+            -v "${{ github.workspace }}":"${{ github.workspace }}" \
+            -v /tmp:/tmp \
             -e DATABASE_URL="postgres://windmill:windmill@localhost:5432/windmill" \
             -e BASE_URL="http://localhost:8000" \
             -e MODE=worker \
