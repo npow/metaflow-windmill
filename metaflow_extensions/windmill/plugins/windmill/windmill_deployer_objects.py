@@ -151,13 +151,14 @@ class WindmillTriggeredRun(TriggeredRun):
         old_meta = os.environ.get("METAFLOW_DEFAULT_METADATA")
         old_sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
         try:
+            if meta_type == "local" and sysroot is None:
+                sysroot = os.path.expanduser("~")
+            # Set sysroot FIRST so metaflow.metadata() picks it up correctly
+            if sysroot:
+                os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
             if meta_type:
                 os.environ["METAFLOW_DEFAULT_METADATA"] = meta_type
                 metaflow.metadata(meta_type)
-            if meta_type == "local" and sysroot is None:
-                sysroot = os.path.expanduser("~")
-            if sysroot:
-                os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
 
             pathspec = self.pathspec
             if pathspec and pathspec.startswith("UNKNOWN/"):
@@ -173,10 +174,6 @@ class WindmillTriggeredRun(TriggeredRun):
                 return run
             except MetaflowNotFound:
                 pass
-            except Exception as exc:
-                # Log unexpected errors to help debug (e.g. PermissionError on root-owned files)
-                import sys
-                print("DEBUG WindmillTriggeredRun.run: unexpected error for %r: %s" % (pathspec, exc), file=sys.stderr)
 
             # Pathspec not found - query Windmill to find the actual run_id
             actual_run_id = self._resolve_run_id_from_windmill()
@@ -191,9 +188,6 @@ class WindmillTriggeredRun(TriggeredRun):
                     return run
                 except MetaflowNotFound:
                     pass
-                except Exception as exc:
-                    import sys
-                    print("DEBUG WindmillTriggeredRun.run: unexpected error for %r: %s" % (new_pathspec, exc), file=sys.stderr)
 
             return None
         finally:
@@ -209,12 +203,9 @@ class WindmillTriggeredRun(TriggeredRun):
     @property
     def status(self) -> Optional[str]:
         """Return a simple status string based on the underlying Metaflow run."""
-        import sys
         run = self.run
         if run is None:
-            print("DEBUG status: run is None for pathspec=%r" % self.pathspec, file=sys.stderr)
             return "PENDING"
-        print("DEBUG status: run=%r successful=%r finished=%r" % (run, run.successful, run.finished), file=sys.stderr)
         if run.successful:
             return "SUCCEEDED"
         if run.finished:
