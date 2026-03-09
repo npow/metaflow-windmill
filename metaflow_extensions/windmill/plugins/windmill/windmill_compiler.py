@@ -5,11 +5,11 @@ Converts a Metaflow FlowGraph into a Windmill OpenFlow JSON definition.
 Each Metaflow step becomes a Windmill flow module that runs a bash script.
 
 Supported Metaflow graph patterns:
-  linear       - sequential modules
-  split/join   - parallel branches (branchall modules)
-  foreach      - forloopflow modules (single level)
-  nested foreach - NOT supported (raises NotSupportedException)
-  split-switch - NOT supported (raises NotSupportedException)
+  linear        - sequential modules
+  split/join    - parallel branches (branchall modules)
+  foreach       - forloopflow modules (single level)
+  nested foreach - nested forloopflow modules (outer iterates, inner iterates per item)
+  split-switch  - branchone modules (@condition decorator)
 
 The compiled flow runs each Metaflow step via bash:
   python flow.py --no-pylint step <step_name>
@@ -318,10 +318,11 @@ class WindmillCompiler:
                 self._visit_node(join_step, out, visited)
 
         elif ntype == "split-switch":
-            raise NotSupportedException(
-                "Step *%s* uses a conditional split (@condition) which is not "
-                "supported with Windmill." % step_name
-            )
+            out.append(self._build_switch_step_module(node))
+            out.append(self._build_branchone_module(node, visited))
+            join_step = self._find_join_step(step_name)
+            if join_step:
+                self._visit_node(join_step, out, visited)
 
         elif ntype == "join":
             out.append(self._build_step_module(node))
@@ -607,37 +608,82 @@ INPUT_PATHS={input_paths_expr}
 
         return module
 
-    def _build_foreach_module(self, foreach_node, visited: set) -> dict:
-        """Build a Windmill forloopflow module for a Metaflow foreach step."""
+    def _build_foreach_body_modules(self, foreach_node, visited: set) -> list:
+        """Build the list of modules for the body of a forloopflow.
+
+        For a simple (non-nested) foreach the body is a single rawscript module.
+
+        For a nested foreach (body step is itself a foreach), the returned list is:
+          [body_foreach_step_module, inner_forloopflow_module, inner_join_module]
+
+        The inner_join runs once per outer iteration and is therefore INSIDE the
+        outer forloopflow body.  It is also added to ``visited`` so the top-level
+        walker does not re-emit it.
+
+        The outer join (the join for ``foreach_node`` itself) is NOT marked
+        visited here — the caller (_visit_node) is responsible for emitting it at
+        the top level after the outer forloopflow module.
+        """
         body_name = foreach_node.out_funcs[0]
         body_node = self.graph[body_name]
+        visited.add(body_name)
 
         if body_node.type == "foreach":
-            raise NotSupportedException(
-                "Nested foreach (foreach inside foreach) is not supported with Windmill. "
-                "Step *%s* contains a nested foreach step *%s*." % (
-                    foreach_node.name, body_name
-                )
+            # Nested foreach: the body step is itself a foreach step.
+            # Layout: [body_step, inner_forloopflow, inner_join]
+            body_step_module = self._build_foreach_body_step_module(
+                body_node, foreach_node.name
             )
+            # Recursively build the inner forloopflow body modules.
+            inner_body_modules = self._build_foreach_body_modules(body_node, visited)
+            inner_foreach_module = {
+                "id": "foreach_%s" % body_node.name,
+                "summary": "ForEach (inner): %s" % body_node.name,
+                "value": {
+                    "type": "forloopflow",
+                    "modules": inner_body_modules,
+                    "iterator": {
+                        "type": "javascript",
+                        "expr": (
+                            "results.%s !== undefined && results.%s.foreach_values "
+                            "? results.%s.foreach_values : []"
+                        ) % (body_node.name, body_node.name, body_node.name),
+                    },
+                    "parallel": True,
+                    "parallelism": self.max_workers,
+                    "skip_failures": False,
+                },
+            }
+            # The join for the inner foreach runs once per outer iteration —
+            # include it inside the outer body and mark it visited so the
+            # top-level walker doesn't re-emit it.
+            inner_join_name = self._find_foreach_join(body_node.name)
+            result = [body_step_module, inner_foreach_module]
+            if inner_join_name:
+                visited.add(inner_join_name)
+                result.append(self._build_step_module(self.graph[inner_join_name]))
+            return result
+        else:
+            # Simple (leaf) foreach body: one rawscript module.
+            return [self._build_foreach_body_step_module(body_node, foreach_node.name)]
 
-        visited.add(body_name)
-        join_name = self._find_foreach_join(foreach_node.name)
-        if join_name:
-            visited.add(join_name)
+    def _build_foreach_body_step_module(self, body_node, parent_foreach_name: str) -> dict:
+        """Build the rawscript module for a single foreach body step.
 
+        Uses WM_ITERATION_INDEX as the split-index so each iteration runs a
+        separate Metaflow task.
+        """
         env_exports = self._env_export_lines()
-        step_base_cmd = self._step_cmd(body_name)
+        step_base_cmd = self._step_cmd(body_node.name)
 
-        # Body script: uses WM_ITERATION_INDEX for split-index
-        # RUN_ID is shared via /tmp file since same_worker=True.
-        # The foreach parent step is the input for the body step.
-        body_node = self.graph[body_name]
         body_in_funcs = list(body_node.in_funcs)
         if len(body_in_funcs) == 1:
-            body_input_paths_expr = '"$RUN_ID/%s/1"' % body_in_funcs[0]
+            body_input_paths_expr = '"$RUN_ID/%s/$SPLIT_INDEX"' % body_in_funcs[0]
         else:
+            # Multiple parents (join of multiple foreachs) — rare but handle it.
+            # Use SPLIT_INDEX for task ID of each parent.
             body_input_paths_expr = '"' + ",".join(
-                "$RUN_ID/%s/1" % p for p in body_in_funcs
+                "$RUN_ID/%s/$SPLIT_INDEX" % p for p in body_in_funcs
             ) + '"'
 
         body_script = '''\
@@ -665,9 +711,9 @@ INPUT_PATHS={body_input_paths_expr}
             body_input_paths_expr=body_input_paths_expr,
         )
 
-        body_module = {
-            "id": body_name,
-            "summary": "Step: %s (foreach body)" % body_name,
+        return {
+            "id": body_node.name,
+            "summary": "Step: %s (foreach body)" % body_node.name,
             "value": {
                 "type": "rawscript",
                 "content": body_script,
@@ -676,14 +722,21 @@ INPUT_PATHS={body_input_paths_expr}
             },
         }
 
-        # Iterator: use values from foreach parent step's foreach_values output
-        # The foreach parent step (bash) must print JSON array of values to stdout
+    def _build_foreach_module(self, foreach_node, visited: set) -> dict:
+        """Build a Windmill forloopflow module for a Metaflow foreach step.
+
+        Supports single-level and nested foreach (foreach inside foreach).
+        For nested foreach the body modules themselves contain a forloopflow.
+        """
+        body_modules = self._build_foreach_body_modules(foreach_node, visited)
+
+        # Iterator: use foreach_values output from the foreach step script.
         foreach_module = {
             "id": "foreach_%s" % foreach_node.name,
             "summary": "ForEach: %s" % foreach_node.name,
             "value": {
                 "type": "forloopflow",
-                "modules": [body_module],
+                "modules": body_modules,
                 "iterator": {
                     "type": "javascript",
                     "expr": (
@@ -721,6 +774,152 @@ INPUT_PATHS={body_input_paths_expr}
             },
         }
 
+    def _build_switch_step_module(self, node) -> dict:
+        """Build a step module for a split-switch node.
+
+        The script runs the Metaflow step normally, then reads the chosen branch
+        from the _transition artifact in the datastore and outputs a JSON object
+        ``{"branch": "<chosen_step_name>"}`` to stdout.  Windmill captures this
+        as ``results.<step_name>`` so that the subsequent branchone predicates can
+        reference ``results.<step_name>.branch``.
+        """
+        env_exports = self._env_export_lines()
+        step_base_cmd = self._step_cmd(node.name)
+
+        in_funcs = list(node.in_funcs)
+        if node.name == "start":
+            input_paths_expr = '"$RUN_ID/_parameters/1"'
+        elif len(in_funcs) == 1:
+            parent = in_funcs[0]
+            input_paths_expr = '"$RUN_ID/%s/1"' % parent
+        else:
+            parent_paths = ",".join("$RUN_ID/%s/1" % p for p in in_funcs)
+            input_paths_expr = '"%s"' % parent_paths
+
+        # After the step runs, read the _transition artifact to find the chosen branch.
+        # _transition is stored as a pickled Python tuple ([step_name], None).
+        # We use Python inline to unpickle it and emit JSON.
+        sysroot = self._datastore_root or ""
+        read_transition_py = (
+            "import pickle, json, sys, os; "
+            "root = os.environ.get('METAFLOW_DATASTORE_SYSROOT_LOCAL', '%s'); "
+            "run_id = open('/tmp/mf_windmill_run_id.txt').read().strip(); "
+            "p = os.path.join(root, '.metaflow', '%s', 'data'); "
+            "# read _transition from task datastore (attempt 0); "
+            "import metaflow; "
+            "from metaflow.datastore import FlowDataStore; "
+            "from metaflow.plugins import DATASTORES; "
+            "impl = next(d for d in DATASTORES if d.TYPE == 'local'); "
+            "fds = FlowDataStore('%s', None, storage_impl=impl, "
+            "ds_root=os.path.join(root, '.metaflow')); "
+            "tds = fds.get_task_datastore(run_id, '%s', '1', attempt=0, mode='r'); "
+            "tr = tds['_transition']; "
+            "branch = tr[0][0] if tr and tr[0] else 'unknown'; "
+            "print(json.dumps({'branch': branch}))"
+        ) % (sysroot, self.name, self.name, node.name)
+
+        script = '''\
+#!/bin/bash
+set -e
+
+# Set up Metaflow environment
+{env_exports}
+
+# Restore run ID written by the metaflow_init module (same_worker=True shares /tmp)
+RUN_ID=$(cat /tmp/mf_windmill_run_id.txt 2>/dev/null || echo "")
+if [ -z "$RUN_ID" ]; then
+  echo "ERROR: RUN_ID not set. Init step may have failed or same_worker is not enabled."
+  exit 1
+fi
+
+# REQUIRED (Cap.RETRY): retry_count from Windmill native attempt counter
+RETRY_COUNT="${{WM_FLOW_RETRY_COUNT:-0}}"
+
+INPUT_PATHS={input_paths_expr}
+
+{step_cmd} --run-id "$RUN_ID" --task-id 1 --retry-count "$RETRY_COUNT" --input-paths "$INPUT_PATHS"
+
+# Read the chosen branch from the Metaflow datastore and output as JSON
+# so that the branchone module can pick the correct branch at runtime.
+python3 -c "{read_transition_py}"
+'''.format(
+            env_exports=env_exports,
+            step_cmd=step_base_cmd,
+            input_paths_expr=input_paths_expr,
+            read_transition_py=read_transition_py,
+        )
+
+        retries, retry_delay = self._get_retry_config(node)
+        timeout = self._get_timeout(node)
+
+        module = {
+            "id": node.name,
+            "summary": "Step: %s (conditional split)" % node.name,
+            "value": {
+                "type": "rawscript",
+                "content": script,
+                "language": "bash",
+                "input_transforms": {},
+            },
+        }
+
+        if retries > 0:
+            module["retry"] = {
+                "constant": {
+                    "attempts": retries,
+                    "seconds": retry_delay,
+                },
+            }
+
+        if timeout:
+            module["timeout"] = timeout
+
+        return module
+
+    def _build_branchone_module(self, switch_node, visited: set) -> dict:
+        """Build a Windmill branchone module for a Metaflow split-switch node.
+
+        Each case in ``switch_node.switch_cases`` becomes a branch with a JS
+        predicate ``results.<switch_step>.branch == '<step_name>'``.  Branch
+        steps are collected until the join.  The join step is NOT marked visited
+        here; the caller (_visit_node) is responsible for visiting it after this
+        module so it gets emitted at the top level.
+        """
+
+        branches = []
+        # switch_cases maps case_label -> step_name
+        # We build one branch per case.  The last case goes into the branchone
+        # "default" so we need at least one non-default branch.
+        case_items = list(switch_node.switch_cases.items())
+        # All branches except the last become explicit predicates;
+        # the last becomes the default (Windmill requires a default).
+        predicate_cases = case_items[:-1]
+        default_case = case_items[-1] if case_items else None
+
+        for _case_label, step_name in predicate_cases:
+            branch_modules = []
+            self._collect_branch_modules(step_name, branch_modules, visited)
+            branches.append({
+                "summary": step_name,
+                "expr": "results.%s.branch === '%s'" % (switch_node.name, step_name),
+                "modules": branch_modules,
+            })
+
+        default_modules = []
+        if default_case:
+            _default_label, default_step = default_case
+            self._collect_branch_modules(default_step, default_modules, visited)
+
+        return {
+            "id": "switch_%s" % switch_node.name,
+            "summary": "Conditional split from: %s" % switch_node.name,
+            "value": {
+                "type": "branchone",
+                "branches": branches,
+                "default": default_modules,
+            },
+        }
+
     def _collect_branch_modules(self, step_name: str, out: list, visited: set):
         """Collect modules for one branch of a parallel split until a join."""
         if step_name in visited:
@@ -749,10 +948,37 @@ INPUT_PATHS={body_input_paths_expr}
         return self.graph[body_name].out_funcs[0]
 
     def _find_join_step(self, split_step_name: str) -> Optional[str]:
-        """Return the join step for a given split step."""
-        for node in self.graph:
-            if node.type == "join":
-                parents = list(getattr(node, "split_parents", []))
-                if parents and parents[-1] == split_step_name:
-                    return node.name
+        """Return the join step for a given split step.
+
+        For regular split nodes, the join node's split_parents[-1] equals the
+        split step name.  For split-switch nodes the graph traversal does not
+        push the switch onto split_parents, so we fall back to tracing through
+        the branch steps to find the convergent join.
+        """
+        split_node = self.graph[split_step_name]
+
+        # Fast path: regular split uses split_parents
+        if split_node.type == "split":
+            for node in self.graph:
+                if node.type == "join":
+                    parents = list(getattr(node, "split_parents", []))
+                    if parents and parents[-1] == split_step_name:
+                        return node.name
+
+        # For split-switch (and as a fallback for split), follow branch out_funcs
+        # until we hit a join node — that's the convergence point.
+        for branch_name in split_node.out_funcs:
+            branch_node = self.graph[branch_name]
+            # Walk forward until we find the join
+            current = branch_node
+            while current is not None:
+                for next_name in current.out_funcs:
+                    next_node = self.graph[next_name]
+                    if next_node.type == "join":
+                        return next_name
+                    current = next_node
+                    break  # follow the first out_func
+                else:
+                    break
+
         return None

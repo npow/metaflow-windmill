@@ -81,7 +81,19 @@ with Deployer("flow.py") as d:
 
 Each Metaflow step becomes a Windmill flow module that runs a bash script. The bash script calls `python flow.py step <step_name>` with `--run-id`, `--task-id`, and `--retry-count` derived from Windmill's native `WM_FLOW_RETRY_COUNT` environment variable. Branch/join steps compile to Windmill `branchall` modules; foreach steps compile to `forloopflow` modules with a configurable `max_workers` concurrency limit. The Metaflow run ID is pre-computed before triggering and threaded through every step so Metaflow's local datastore and the Windmill job ID stay in sync.
 
-Supported graph patterns: linear, branch/join, foreach (including nested foreach), `@condition` splits. `@parallel` and `@batch` are not supported.
+Supported graph patterns:
+
+| Metaflow pattern | Windmill module |
+|---|---|
+| Linear steps | `rawscript` sequence |
+| Split / join (static branches) | `branchall` |
+| ForEach | `forloopflow` |
+| Nested ForEach | nested `forloopflow` |
+| `@condition` (conditional split) | `branchone` |
+
+For `@condition` splits, the split step emits `{"branch": "<step_name>"}` to stdout after running. The subsequent `branchone` module uses `results.<split_step>.branch === '<step_name>'` as the predicate so Windmill routes to the correct branch at runtime.
+
+`@parallel` and `@batch` are not supported — Windmill runs each step as a local subprocess on the worker.
 
 ## Configuration
 

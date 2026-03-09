@@ -225,12 +225,9 @@ def test_branch_forwarded_in_step_scripts():
     assert "--branch mybranch" in script
 
 
-def test_nested_foreach_raises():
-    """Nested foreach raises NotSupportedException."""
+def test_nested_foreach_compiles():
+    """Nested foreach compiles to a nested forloopflow structure."""
     from metaflow import FlowSpec, step
-    from metaflow_extensions.windmill.plugins.windmill.exception import (
-        NotSupportedException,
-    )
 
     class NestedForeachFlow(FlowSpec):
         @step
@@ -260,8 +257,38 @@ def test_nested_foreach_raises():
             pass
 
     compiler = _make_compiler(NestedForeachFlow)
-    with pytest.raises(NotSupportedException):
-        compiler.compile()
+    result = compiler.compile()
+
+    modules = result["value"]["modules"]
+    module_ids = [m["id"] for m in modules]
+
+    # Outer forloopflow should be present
+    assert "foreach_start" in module_ids, "Expected outer forloopflow module"
+
+    # Find the outer forloopflow
+    outer_foreach = next(m for m in modules if m["id"] == "foreach_start")
+    assert outer_foreach["value"]["type"] == "forloopflow"
+
+    # The body of the outer forloopflow should contain the outer_step module
+    # followed by an inner forloopflow
+    outer_body = outer_foreach["value"]["modules"]
+    outer_body_ids = [m["id"] for m in outer_body]
+    assert "outer_step" in outer_body_ids, "outer_step should be in outer foreach body"
+    assert "foreach_outer_step" in outer_body_ids, "inner forloopflow missing from outer foreach body"
+
+    # The inner forloopflow body should contain inner_step
+    inner_foreach = next(m for m in outer_body if m["id"] == "foreach_outer_step")
+    assert inner_foreach["value"]["type"] == "forloopflow"
+    inner_body_ids = [m["id"] for m in inner_foreach["value"]["modules"]]
+    assert "inner_step" in inner_body_ids, "inner_step should be in inner foreach body"
+
+    # inner_join runs once per outer iteration, so it lives INSIDE the outer
+    # forloopflow body (not at the top level).
+    assert "inner_join" in outer_body_ids, "inner_join should be inside outer foreach body"
+
+    # outer_join runs once after all outer iterations, so it lives at the top level.
+    assert "outer_join" in module_ids, "outer_join should be at top level"
+    assert "end" in module_ids, "end step should be at top level"
 
 
 def test_from_deployment_dotted_name():
@@ -296,3 +323,68 @@ def test_run_params_is_list():
     run_params = list("%s=%s" % (k, v) for k, v in kwargs.items())
     assert isinstance(run_params, list), "run_params must be a list"
     assert len(run_params) == 2
+
+
+def test_conditional_split_compiles():
+    """@condition (split-switch) compiles to a branchone module."""
+    from metaflow import FlowSpec, step
+
+    class CondFlow(FlowSpec):
+        @step
+        def start(self):
+            self.my_cond = "branch_a"
+            self.next(
+                {"branch_a": self.branch_a, "branch_b": self.branch_b},
+                condition="my_cond",
+            )
+
+        @step
+        def branch_a(self):
+            self.next(self.join)
+
+        @step
+        def branch_b(self):
+            self.next(self.join)
+
+        @step
+        def join(self, inputs):
+            self.next(self.end)
+
+        @step
+        def end(self):
+            pass
+
+    compiler = _make_compiler(CondFlow)
+    result = compiler.compile()
+
+    modules = result["value"]["modules"]
+    module_ids = [m["id"] for m in modules]
+
+    # The switch step should be present as a rawscript module
+    assert "start" in module_ids, "start step missing"
+
+    # A branchone module should follow the switch step
+    assert "switch_start" in module_ids, "branchone module 'switch_start' missing"
+
+    switch_module = next(m for m in modules if m["id"] == "switch_start")
+    assert switch_module["value"]["type"] == "branchone"
+
+    # Branches: one explicit predicate + one default
+    branches = switch_module["value"]["branches"]
+    default = switch_module["value"]["default"]
+
+    # One of branch_a/branch_b is a predicate branch, the other is default
+    all_branch_names = [b["summary"] for b in branches] + (
+        [default[0]["id"]] if default else []
+    )
+    assert "branch_a" in all_branch_names, "branch_a missing from branchone"
+    assert "branch_b" in all_branch_names, "branch_b missing from branchone"
+
+    # Predicate branches reference results.<switch_step>.branch
+    for branch in branches:
+        assert "results.start.branch" in branch["expr"], (
+            "Branch predicate should reference results.start.branch"
+        )
+
+    # Join step emitted at top level after branchone
+    assert "join" in module_ids, "join step should be at top level after branchone"
