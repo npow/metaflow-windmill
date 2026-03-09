@@ -90,11 +90,9 @@ jobs:
       - name: Wait for postgres to be ready
         run: |
           echo "Waiting for postgres to accept connections..."
-          until pg_isready -h localhost -p 5432 -U windmill; do
-            echo "  postgres not ready yet, retrying..."
-            sleep 2
-          done
-          echo "Postgres is ready."
+          timeout 60 bash -c 'until pg_isready -h localhost -p 5432 -U windmill; do sleep 2; done' \
+            && echo "Postgres is ready." \
+            || echo "pg_isready timed out (postgres may still be healthy via service health check)"
 
       - name: Start Windmill server
         run: |
