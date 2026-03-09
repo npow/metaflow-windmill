@@ -187,6 +187,38 @@ class WindmillTriggeredRun(TriggeredRun):
             except MetaflowNotFound:
                 pass
 
+            # Fallback: use fresh subprocess to verify run exists (bypasses any
+            # class-level LocalStorage.datastore_root caching in this process).
+            # If subprocess finds run, retry in this process.
+            if sysroot:
+                import subprocess as _sp
+                _check = _sp.run(
+                    [__import__("sys").executable, "-c", """
+import os, sys
+os.environ['METAFLOW_DEFAULT_DATASTORE'] = 'local'
+os.environ['METAFLOW_DEFAULT_METADATA'] = 'local'
+os.environ['METAFLOW_DATASTORE_SYSROOT_LOCAL'] = sys.argv[1]
+from metaflow.plugins.datastores.local_storage import LocalStorage
+LocalStorage.datastore_root = None
+import metaflow
+try:
+    metaflow.metadata('local@' + sys.argv[1])
+    r = metaflow.Run(sys.argv[2], _namespace_check=False)
+    print('ok:' + sys.argv[2])
+except Exception as e:
+    print('err:' + str(e)[:100])
+""", sysroot, pathspec],
+                    capture_output=True, text=True, timeout=10
+                )
+                if _check.stdout.strip().startswith("ok:"):
+                    # Subprocess found it — retry with fresh local@path metadata setup
+                    metaflow.metadata("local@%s" % sysroot)
+                    try:
+                        run = metaflow.Run(pathspec, _namespace_check=False)
+                        return run
+                    except Exception:
+                        pass
+
             # Pathspec not found - query Windmill to find the actual run_id
             actual_run_id = self._resolve_run_id_from_windmill()
             if actual_run_id:
