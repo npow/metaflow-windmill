@@ -169,9 +169,14 @@ class WindmillTriggeredRun(TriggeredRun):
 
             # Try the direct pathspec first
             try:
-                return metaflow.Run(pathspec, _namespace_check=False)
+                run = metaflow.Run(pathspec, _namespace_check=False)
+                return run
             except MetaflowNotFound:
                 pass
+            except Exception as exc:
+                # Log unexpected errors to help debug (e.g. PermissionError on root-owned files)
+                import sys
+                print("DEBUG WindmillTriggeredRun.run: unexpected error for %r: %s" % (pathspec, exc), file=sys.stderr)
 
             # Pathspec not found - query Windmill to find the actual run_id
             actual_run_id = self._resolve_run_id_from_windmill()
@@ -182,9 +187,13 @@ class WindmillTriggeredRun(TriggeredRun):
                 new_pathspec = "%s/%s" % (flow_name, actual_run_id)
                 self.pathspec = new_pathspec
                 try:
-                    return metaflow.Run(new_pathspec, _namespace_check=False)
+                    run = metaflow.Run(new_pathspec, _namespace_check=False)
+                    return run
                 except MetaflowNotFound:
                     pass
+                except Exception as exc:
+                    import sys
+                    print("DEBUG WindmillTriggeredRun.run: unexpected error for %r: %s" % (new_pathspec, exc), file=sys.stderr)
 
             return None
         finally:
@@ -200,9 +209,12 @@ class WindmillTriggeredRun(TriggeredRun):
     @property
     def status(self) -> Optional[str]:
         """Return a simple status string based on the underlying Metaflow run."""
+        import sys
         run = self.run
         if run is None:
+            print("DEBUG status: run is None for pathspec=%r" % self.pathspec, file=sys.stderr)
             return "PENDING"
+        print("DEBUG status: run=%r successful=%r finished=%r" % (run, run.successful, run.finished), file=sys.stderr)
         if run.successful:
             return "SUCCEEDED"
         if run.finished:
