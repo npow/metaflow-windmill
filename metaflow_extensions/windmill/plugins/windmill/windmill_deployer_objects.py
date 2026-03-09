@@ -431,9 +431,14 @@ class WindmillDeployedFlow(DeployedFlow):
             windmill_token = os.environ.get("WINDMILL_TOKEN", "")
             windmill_workspace = os.environ.get("WINDMILL_WORKSPACE", "admins")
 
-            # REQUIRED (Cap.FROM_DEPLOYMENT): handle dotted names
-            flow_name = identifier.split(".")[-1]
-            flow_path = flow_name_to_path(flow_name)
+            # REQUIRED (Cap.FROM_DEPLOYMENT): handle dotted names.
+            # If identifier already contains '/' it's a Windmill path — use as-is.
+            if "/" in identifier:
+                flow_name = identifier.split("/")[-1]
+                flow_path = identifier
+            else:
+                flow_name = identifier.split(".")[-1]
+                flow_path = flow_name_to_path(flow_name)
 
             deployer = _make_stub_deployer(flow_name)
             deployer.name = flow_name
