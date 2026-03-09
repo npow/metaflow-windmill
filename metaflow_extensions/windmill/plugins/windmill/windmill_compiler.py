@@ -561,7 +561,7 @@ set -e
 # System python3 in Windmill container may lack pip — install it first.
 # Use --break-system-packages for Ubuntu 22.04+ / Debian 12+ (PEP 668).
 if ! python3 -c "import metaflow" 2>/dev/null; then
-    python3 -c "import pip" 2>/dev/null || apt-get install -y -q python3-pip 2>/dev/null || true
+    python3 -c "import pip" 2>/dev/null || (apt-get update -q 2>/dev/null; apt-get install -y -q python3-pip 2>/dev/null) || true
     python3 -m pip install --break-system-packages --quiet "metaflow>=2.9" 2>&1 || \
     python3 -m pip install --quiet "metaflow>=2.9" 2>&1 || true
 fi
@@ -840,7 +840,7 @@ set -e
 # System python3 in Windmill container may lack pip — install it first.
 # Use --break-system-packages for Ubuntu 22.04+ / Debian 12+ (PEP 668).
 if ! python3 -c "import metaflow" 2>/dev/null; then
-    python3 -c "import pip" 2>/dev/null || apt-get install -y -q python3-pip 2>/dev/null || true
+    python3 -c "import pip" 2>/dev/null || (apt-get update -q 2>/dev/null; apt-get install -y -q python3-pip 2>/dev/null) || true
     python3 -m pip install --break-system-packages --quiet "metaflow>=2.9" 2>&1 || \
     python3 -m pip install --quiet "metaflow>=2.9" 2>&1 || true
 fi

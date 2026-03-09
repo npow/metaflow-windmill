@@ -129,9 +129,9 @@ jobs:
           # causing: ValueError: Cannot locate metadata_provider plugin 'service'.
           for i in $(seq 1 30); do
             if docker exec windmill_worker bash -c "
-              # Install pip if missing
+              # Install pip if missing (apt-get update needed — stale cache in container)
               python3 -c 'import pip' 2>/dev/null || \
-                apt-get install -y -q python3-pip 2>&1 || true
+                (apt-get update -q 2>&1 && apt-get install -y -q python3-pip 2>&1) || true
               # Install metaflow from PyPI (OSS-only, no internal plugins)
               python3 -m pip install --break-system-packages -q 'metaflow>=2.9' 2>&1 || \
               python3 -m pip install -q 'metaflow>=2.9' 2>&1
