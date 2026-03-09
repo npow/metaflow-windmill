@@ -236,6 +236,9 @@ jobs:
             "AWS_SECRET_ACCESS_KEY=" \
             "PYTHONPATH=${{ github.workspace }}/metaflow-src" \
             "METAFLOW_WINDMILL_DEBUG=1" \
+            "WINDMILL_HOST=http://localhost:8000" \
+            "WINDMILL_TOKEN=${{ steps.windmill_token.outputs.token }}" \
+            "WINDMILL_WORKSPACE=admins" \
             python -m pytest \
               metaflow-src/test/ux/core/test_basic.py \
               -k "${{ matrix.test }} and deployer" \
