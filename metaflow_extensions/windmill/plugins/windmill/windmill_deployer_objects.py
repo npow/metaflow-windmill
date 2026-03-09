@@ -200,11 +200,49 @@ class WindmillTriggeredRun(TriggeredRun):
             else:
                 os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = old_sysroot
 
+    def _check_sysroot_completion(self) -> Optional[str]:
+        """Bypass metaflow.Run() and check the sysroot directly for run completion.
+
+        This handles cases where metaflow.Run() fails due to class-level caching of
+        LocalStorage.datastore_root across test runs in the same pytest session.
+        Checks for 0.DONE.lock in the end step directory as a completion signal.
+        """
+        env_vars = getattr(self.deployer, "env_vars", {}) or {}
+        sysroot = env_vars.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
+        if not sysroot:
+            return None
+        pathspec = self.pathspec
+        if not pathspec or "/" not in pathspec:
+            return None
+        flow_name, run_id = pathspec.split("/", 1)
+        run_dir = os.path.join(sysroot, ".metaflow", flow_name, run_id)
+        if not os.path.isdir(run_dir):
+            return None
+        # Check if end step completed via 0.DONE.lock or 0.task_end
+        import glob
+        done_patterns = [
+            os.path.join(run_dir, "end", "*", "0.DONE.lock"),
+            os.path.join(run_dir, "end", "*", "0.task_end"),
+        ]
+        for pattern in done_patterns:
+            if glob.glob(pattern):
+                return "SUCCEEDED"
+        # Check for task_ok artifact indicating successful end
+        end_meta = glob.glob(os.path.join(run_dir, "end", "*", "_meta", "0_artifact__task_ok.json"))
+        if end_meta:
+            return "SUCCEEDED"
+        # Run directory exists but end step not done yet
+        return "RUNNING"
+
     @property
     def status(self) -> Optional[str]:
         """Return a simple status string based on the underlying Metaflow run."""
         run = self.run
         if run is None:
+            # Fallback: check filesystem directly (avoids metaflow.Run() caching issues)
+            sysroot_status = self._check_sysroot_completion()
+            if sysroot_status:
+                return sysroot_status
             return "PENDING"
         if run.successful:
             return "SUCCEEDED"
