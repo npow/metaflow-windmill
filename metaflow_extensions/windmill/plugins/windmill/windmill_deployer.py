@@ -25,6 +25,7 @@ OrchestratorCapabilities contract — implemented in windmill_compiler.py:
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, ClassVar, Dict, Optional, Type
 
 from metaflow.runner.deployer_impl import DeployerImpl
@@ -66,6 +67,36 @@ class WindmillDeployer(DeployerImpl):
     def deployed_flow_type() -> Type["WindmillDeployedFlow"]:
         from .windmill_deployer_objects import WindmillDeployedFlow
         return WindmillDeployedFlow
+
+    @classmethod
+    def create_stub(
+        cls, name: str, additional_info: dict = None
+    ) -> "WindmillDeployer":
+        """Construct a minimal deployer for ``from_deployment()`` (no flow file).
+
+        Bypasses ``DeployerImpl.__init__`` (which requires a valid flow file)
+        and sets only the attributes that WindmillDeployedFlow.run() and
+        _trigger_direct() need.
+        """
+        from metaflow.runner.subprocess_manager import SubprocessManager
+
+        deployer = object.__new__(cls)
+        deployer._deployer_kwargs = {}
+        deployer.flow_file = ""
+        deployer.name = name
+        deployer.flow_name = name
+        deployer.metadata = "{}"
+        deployer.additional_info = additional_info or {}
+        deployer.show_output = False
+        deployer.profile = None
+        deployer.env = None
+        deployer.cwd = os.getcwd()
+        deployer.file_read_timeout = 3600
+        deployer.env_vars = os.environ.copy()
+        deployer.spm = SubprocessManager()
+        deployer.top_level_kwargs = {}
+        deployer.api = None
+        return deployer
 
     def create(self, **kwargs) -> "WindmillDeployedFlow":
         """Deploy this flow to a running Windmill instance.

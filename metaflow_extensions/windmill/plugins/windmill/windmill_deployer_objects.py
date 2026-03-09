@@ -27,7 +27,6 @@ import metaflow
 from metaflow.exception import MetaflowNotFound
 from metaflow.runner.deployer import DeployedFlow, TriggeredRun
 from metaflow.runner.utils import get_lower_level_group, handle_timeout, temporary_fifo
-from metaflow.runner.subprocess_manager import SubprocessManager
 
 
 def _find_flow_for_run_id(sysroot: str, run_id: str) -> Optional[str]:
@@ -39,34 +38,6 @@ def _find_flow_for_run_id(sysroot: str, run_id: str) -> Optional[str]:
         if os.path.isdir(os.path.join(mf_root, entry, run_id)):
             return entry
     return None
-
-
-def _make_stub_deployer(name: str):
-    """Create a minimal WindmillDeployer without running __init__.
-
-    Used by ``from_deployment()`` when recovering a deployed flow from an
-    identifier string (no flow file available).  Sets the subset of attributes
-    that WindmillDeployedFlow.run() and _trigger_direct() need.
-    """
-    from .windmill_deployer import WindmillDeployer
-
-    stub = object.__new__(WindmillDeployer)
-    stub._deployer_kwargs = {}
-    stub.flow_file = ""
-    stub.show_output = False
-    stub.profile = None
-    stub.env = None
-    stub.cwd = os.getcwd()
-    stub.file_read_timeout = 3600
-    stub.env_vars = os.environ.copy()
-    stub.spm = SubprocessManager()
-    stub.top_level_kwargs = {}
-    stub.api = None
-    stub.name = name
-    stub.flow_name = name
-    stub.metadata = "{}"
-    stub.additional_info = {}
-    return stub
 
 
 class WindmillTriggeredRun(TriggeredRun):
@@ -306,7 +277,7 @@ class WindmillDeployedFlow(DeployedFlow):
 
     def _trigger_direct(self, **kwargs) -> "WindmillTriggeredRun":
         """Trigger a Windmill flow directly via REST API (no flow file needed)."""
-        import uuid
+        from .windmill_cli import trigger_windmill_flow
 
         additional_info = getattr(self.deployer, "additional_info", {}) or {}
         windmill_host = additional_info.get("windmill_host", "http://localhost:8000")
@@ -318,33 +289,16 @@ class WindmillDeployedFlow(DeployedFlow):
             from .windmill_compiler import flow_name_to_path
             flow_path = flow_name_to_path(self.name)
 
-        try:
-            import requests
-        except ImportError:
-            raise RuntimeError(
-                "The `requests` package is required to trigger Windmill flows."
-            )
-
-        session = requests.Session()
-        if windmill_token:
-            session.headers["Authorization"] = "Bearer %s" % windmill_token
-
-        url = "%s/api/w/%s/jobs/run/f/%s" % (
-            windmill_host, windmill_workspace, flow_path
+        inputs = {k: str(v) for k, v in kwargs.items()}
+        job_id, run_id = trigger_windmill_flow(
+            host=windmill_host,
+            token=windmill_token,
+            workspace=windmill_workspace,
+            flow_path=flow_path,
+            inputs=inputs,
         )
-        run_id = "windmill-" + str(uuid.uuid4()).replace("-", "")[:16]
-        payload = {k: str(v) for k, v in kwargs.items()}
-        payload["METAFLOW_RUN_ID"] = run_id
-        resp = session.post(url, json=payload)
-        if resp.status_code not in (200, 201):
-            raise RuntimeError(
-                "Failed to trigger Windmill flow (HTTP %d): %s"
-                % (resp.status_code, resp.text[:500])
-            )
 
-        job_id = resp.text.strip().strip('"')
         pathspec = "%s/%s" % (self.deployer.flow_name or "UNKNOWN", run_id)
-
         content_dict = {
             "pathspec": pathspec,
             "name": self.name,
@@ -382,40 +336,32 @@ class WindmillDeployedFlow(DeployedFlow):
                 pass
 
         if info is not None:
-            deployer = WindmillDeployer(
-                flow_file=info.get("flow_file") or "", deployer_kwargs={}
-            )
-            deployer.name = info["name"]
-            deployer.flow_name = info["flow_name"]
-            deployer.metadata = metadata or "{}"
-            deployer.additional_info = {
+            name = info["name"]
+            flow_name = info["flow_name"]
+            additional_info = {
                 k: v
                 for k, v in info.items()
                 if k not in ("name", "flow_name", "flow_file")
             }
         else:
-            windmill_host = os.environ.get("WINDMILL_HOST", "http://localhost:8000")
-            windmill_token = os.environ.get("WINDMILL_TOKEN", "")
-            windmill_workspace = os.environ.get("WINDMILL_WORKSPACE", "admins")
-
             # REQUIRED (Cap.FROM_DEPLOYMENT): handle dotted names.
             # If identifier already contains '/' it's a Windmill path — use as-is.
             if "/" in identifier:
-                flow_name = identifier.split("/")[-1]
+                name = identifier.split("/")[-1]
                 flow_path = identifier
             else:
-                flow_name = identifier.split(".")[-1]
-                flow_path = flow_name_to_path(flow_name)
+                name = identifier.split(".")[-1]
+                flow_path = flow_name_to_path(name)
 
-            deployer = _make_stub_deployer(flow_name)
-            deployer.name = flow_name
-            deployer.flow_name = flow_name
-            deployer.metadata = metadata or "{}"
-            deployer.additional_info = {
+            flow_name = name
+            additional_info = {
                 "flow_path": flow_path,
-                "windmill_host": windmill_host,
-                "windmill_token": windmill_token,
-                "windmill_workspace": windmill_workspace,
+                "windmill_host": os.environ.get("WINDMILL_HOST", "http://localhost:8000"),
+                "windmill_token": os.environ.get("WINDMILL_TOKEN", ""),
+                "windmill_workspace": os.environ.get("WINDMILL_WORKSPACE", "admins"),
             }
 
+        deployer = WindmillDeployer.create_stub(name, additional_info)
+        deployer.flow_name = flow_name
+        deployer.metadata = metadata or "{}"
         return cls(deployer=deployer)

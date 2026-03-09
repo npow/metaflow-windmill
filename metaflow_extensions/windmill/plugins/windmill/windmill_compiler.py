@@ -379,8 +379,8 @@ class WindmillCompiler:
             lines.append("export %s='%s'" % (key, safe_val))
         return "\n".join(lines)
 
-    def _step_cmd(self, step_name: str) -> str:
-        """Build the base step command (without retry-count, run-id, task-id)."""
+    def _base_cmd_parts(self) -> list:
+        """Return the shared top-level CLI flags (before any subcommand)."""
         parts = [
             "python3", self.flow_file,
             "--no-pylint",
@@ -407,6 +407,11 @@ class WindmillCompiler:
         for deco in self.with_decorators:
             parts += ["--with", deco]
 
+        return parts
+
+    def _step_cmd(self, step_name: str) -> str:
+        """Build the base step command (without retry-count, run-id, task-id)."""
+        parts = self._base_cmd_parts()
         # NOTE: --tag goes AFTER the 'step' subcommand (not as a top-level flag)
         # in OSS Metaflow.
         parts += ["step", step_name]
@@ -495,32 +500,17 @@ fi'''
             for pname in params
         )
 
-        base_init_cmd = " ".join([
-            "python3", self.flow_file,
-            "--no-pylint",
-            "--quiet",
-            "--metadata", self._metadata_type,
-            "--datastore", self._datastore_type,
-            "--environment", self._environment_type,
-            "--event-logger", self._event_logger_type,
-            "--monitor", self._monitor_type,
-        ])
-        if self._datastore_root:
-            base_init_cmd += " --datastore-root " + self._datastore_root + "/.metaflow"
-        if self.branch:
-            base_init_cmd += " --branch " + self.branch
-        if self.namespace:
-            base_init_cmd += " --namespace " + self.namespace
-        for deco in self.with_decorators:
-            base_init_cmd += " --with " + deco
         # NOTE: --tag goes AFTER the 'init' subcommand (not as a top-level flag)
         # in OSS Metaflow; the NFLX extension moves it to top-level.
         # --task-id is required for 'init' in OSS Metaflow.
         # Parameters are passed as METAFLOW_PARAMETER_* env vars to the start step,
         # not via --run-param (which is a NFLX-only init option).
-        base_init_cmd += " init --run-id $RUN_ID --task-id windmill-params"
+        init_parts = self._base_cmd_parts() + [
+            "init", "--run-id", "$RUN_ID", "--task-id", "windmill-params",
+        ]
         for tag in self.tags:
-            base_init_cmd += " --tag " + tag
+            init_parts += ["--tag", tag]
+        base_init_cmd = " ".join(init_parts)
 
         env_exports = self._env_export_lines()
 
@@ -815,25 +805,8 @@ INPUT_PATHS={body_input_paths_expr}
 
         # After the step runs, read the _transition artifact to find the chosen branch.
         # _transition is stored as a pickled Python tuple ([step_name], None).
-        # We use Python inline to unpickle it and emit JSON.
+        # We use a heredoc for readability instead of a semicolon-separated one-liner.
         sysroot = self._datastore_root or ""
-        read_transition_py = (
-            "import pickle, json, sys, os; "
-            "root = os.environ.get('METAFLOW_DATASTORE_SYSROOT_LOCAL', '%s'); "
-            "run_id = open('/tmp/mf_windmill_run_id.txt').read().strip(); "
-            "p = os.path.join(root, '.metaflow', '%s', 'data'); "
-            "# read _transition from task datastore (attempt 0); "
-            "import metaflow; "
-            "from metaflow.datastore import FlowDataStore; "
-            "from metaflow.plugins import DATASTORES; "
-            "impl = next(d for d in DATASTORES if d.TYPE == 'local'); "
-            "fds = FlowDataStore('%s', None, storage_impl=impl, "
-            "ds_root=os.path.join(root, '.metaflow')); "
-            "tds = fds.get_task_datastore(run_id, '%s', 'windmill-1', attempt=0, mode='r'); "
-            "tr = tds['_transition']; "
-            "branch = tr[0][0] if tr and tr[0] else 'unknown'; "
-            "print(json.dumps({'branch': branch}))"
-        ) % (sysroot, self.name, self.name, node.name)
 
         script = '''\
 #!/bin/bash
@@ -850,14 +823,38 @@ INPUT_PATHS={input_paths_expr}
 
 # Read the chosen branch from the Metaflow datastore and output as JSON
 # so that the branchone module can pick the correct branch at runtime.
-python3 -c "{read_transition_py}"
+python3 << 'PYEOF'
+import json
+import os
+
+import metaflow
+from metaflow.datastore import FlowDataStore
+from metaflow.plugins import DATASTORES
+
+root = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "{sysroot}")
+run_id = open("/tmp/mf_windmill_run_id.txt").read().strip()
+impl = next(d for d in DATASTORES if d.TYPE == "local")
+fds = FlowDataStore(
+    "{flow_name}", None,
+    storage_impl=impl,
+    ds_root=os.path.join(root, ".metaflow"),
+)
+tds = fds.get_task_datastore(
+    run_id, "{step_name}", "windmill-1", attempt=0, mode="r",
+)
+tr = tds["_transition"]
+branch = tr[0][0] if tr and tr[0] else "unknown"
+print(json.dumps({{"branch": branch}}))
+PYEOF
 '''.format(
             env_exports=env_exports,
             bootstrap=self._bootstrap_snippet(),
             restore_run_id=self._restore_run_id_snippet(),
             step_cmd=step_base_cmd,
             input_paths_expr=input_paths_expr,
-            read_transition_py=read_transition_py,
+            sysroot=sysroot,
+            flow_name=self.name,
+            step_name=node.name,
         )
 
         module = {

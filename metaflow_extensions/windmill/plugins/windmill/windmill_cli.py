@@ -10,7 +10,6 @@ Commands
   run      Compile, deploy, trigger an execution and wait for it.
 """
 
-import hashlib
 import json
 import os
 import sys
@@ -22,6 +21,17 @@ from metaflow.util import get_username
 
 from .exception import WindmillException, NotSupportedException
 from .windmill_compiler import WindmillCompiler, flow_name_to_path
+
+
+class WindmillClient:
+    """Thin wrapper around requests.Session with Windmill connection info."""
+
+    __slots__ = ("host", "workspace", "session")
+
+    def __init__(self, host: str, workspace: str, session):
+        self.host = host
+        self.workspace = workspace
+        self.session = session
 
 
 # ---------------------------------------------------------------------------
@@ -164,8 +174,8 @@ def create(
     flow_json = compiler.compile()
     flow_path = compiler.flow_path
 
-    client = _make_client(windmill_host, windmill_token)
-    _deploy_flow(client, windmill_workspace, flow_path, flow_json, obj)
+    client = _make_client(windmill_host, windmill_token, windmill_workspace)
+    _deploy_flow(client, flow_path, flow_json, obj)
 
     if deployer_attribute_file:
         with open(deployer_attribute_file, "w") as f:
@@ -242,14 +252,14 @@ def trigger(
         k, _, v = kv.partition("=")
         params[k.strip()] = v.strip()
 
-    client = _make_client(windmill_host, windmill_token)
+    client = _make_client(windmill_host, windmill_token, windmill_workspace)
 
     obj.echo(
         "Triggering execution of *%s* in workspace *%s*..."
         % (flow_path, windmill_workspace),
         bold=True,
     )
-    job_id, metaflow_run_id = _trigger_job(client, windmill_workspace, flow_path, inputs=params or None)
+    job_id, metaflow_run_id = _trigger_job(client, flow_path, inputs=params or None)
     job_url = "%s/run/%s?workspace=%s" % (windmill_host, job_id, windmill_workspace)
     obj.echo("Job started: *%s*" % job_url)
 
@@ -332,19 +342,17 @@ def run(
     flow_json = compiler.compile()
     flow_path = compiler.flow_path
 
-    client = _make_client(windmill_host, windmill_token)
-    _deploy_flow(client, windmill_workspace, flow_path, flow_json, obj)
+    client = _make_client(windmill_host, windmill_token, windmill_workspace)
+    _deploy_flow(client, flow_path, flow_json, obj)
 
     obj.echo("Triggering execution...", bold=True)
-    job_id, _metaflow_run_id = _trigger_job(client, windmill_workspace, flow_path)
+    job_id, _metaflow_run_id = _trigger_job(client, flow_path)
     job_url = "%s/run/%s?workspace=%s" % (windmill_host, job_id, windmill_workspace)
     obj.echo("Job started: *%s*" % job_url)
 
     if wait:
         obj.echo("Waiting for job to complete...")
-        success, final_state = _wait_for_job(
-            client, windmill_workspace, job_id, obj
-        )
+        success, final_state = _wait_for_job(client, job_id, obj)
         if success:
             obj.echo("Job *%s* completed successfully." % job_id, bold=True)
         else:
@@ -407,8 +415,8 @@ def _build_compiler(
     )
 
 
-def _make_client(host: str, token: str):
-    """Return a requests.Session configured for the given Windmill instance."""
+def _make_client(host: str, token: str, workspace: str = "admins") -> WindmillClient:
+    """Return a WindmillClient configured for the given Windmill instance."""
     try:
         import requests
     except ImportError:
@@ -420,36 +428,31 @@ def _make_client(host: str, token: str):
     if token:
         session.headers["Authorization"] = "Bearer %s" % token
     session.headers["Content-Type"] = "application/json"
-    session._windmill_host = host
-    return session
+    return WindmillClient(host=host, workspace=workspace, session=session)
 
 
-def _deploy_flow(
-    client, workspace: str, flow_path: str, flow_json: dict, obj
-):
+def _deploy_flow(client: WindmillClient, flow_path: str, flow_json: dict, obj):
     """Create or update a Windmill flow via the REST API."""
-    host = client._windmill_host
+    host, workspace = client.host, client.workspace
 
     # Check if flow already exists
     check_url = "%s/api/w/%s/flows/get/%s" % (host, workspace, flow_path)
     try:
-        check_resp = client.get(check_url, headers={"Content-Type": None})
+        check_resp = client.session.get(check_url, headers={"Content-Type": None})
         flow_exists = check_resp.status_code == 200
     except Exception:
         flow_exists = False
 
-    try:
-        if flow_exists:
-            url = "%s/api/w/%s/flows/update/%s" % (host, workspace, flow_path)
-            payload = dict(flow_json)
-            payload["path"] = flow_path
-            resp = client.post(url, json=payload)
-        else:
-            url = "%s/api/w/%s/flows/create" % (host, workspace)
-            payload = dict(flow_json)
-            payload["path"] = flow_path
-            resp = client.post(url, json=payload)
+    if flow_exists:
+        url = "%s/api/w/%s/flows/update/%s" % (host, workspace, flow_path)
+    else:
+        url = "%s/api/w/%s/flows/create" % (host, workspace)
 
+    payload = dict(flow_json)
+    payload["path"] = flow_path
+
+    try:
+        resp = client.session.post(url, json=payload)
         if resp.status_code in (200, 201):
             obj.echo("Flow deployed successfully to Windmill.")
             return
@@ -465,10 +468,12 @@ def _deploy_flow(
         ) from exc
 
 
-def _trigger_job(
-    client, workspace: str, flow_path: str, inputs: dict = None
+def trigger_windmill_flow(
+    host: str, token: str, workspace: str, flow_path: str, inputs: dict = None
 ) -> tuple:
     """Trigger a Windmill flow job and return (job_id, metaflow_run_id).
+
+    Shared by the CLI trigger command and WindmillDeployedFlow._trigger_direct().
 
     We pre-compute the Metaflow run_id before triggering and pass it as
     METAFLOW_RUN_ID flow input so the init module can use the same value.
@@ -476,22 +481,30 @@ def _trigger_job(
     local datastore.
     """
     import uuid
-    # Pre-compute a stable run_id using a UUID
-    metaflow_run_id = "windmill-" + str(uuid.uuid4()).replace("-", "")[:16]
-
-    host = client._windmill_host
-    url = "%s/api/w/%s/jobs/run/f/%s" % (host, workspace, flow_path)
     try:
-        payload = dict(inputs or {})
-        # Pass the pre-computed run_id as a special flow input
-        payload["METAFLOW_RUN_ID"] = metaflow_run_id
-        resp = client.post(url, json=payload)
+        import requests as _requests  # noqa: F811
+    except ImportError:
+        raise WindmillException(
+            "The `requests` package is required to trigger Windmill flows."
+        )
+
+    metaflow_run_id = "windmill-" + str(uuid.uuid4()).replace("-", "")[:16]
+    url = "%s/api/w/%s/jobs/run/f/%s" % (host, workspace, flow_path)
+
+    session = _requests.Session()
+    if token:
+        session.headers["Authorization"] = "Bearer %s" % token
+
+    payload = dict(inputs or {})
+    payload["METAFLOW_RUN_ID"] = metaflow_run_id
+
+    try:
+        resp = session.post(url, json=payload)
         if resp.status_code not in (200, 201):
             raise WindmillException(
                 "Failed to trigger job (HTTP %d): %s"
                 % (resp.status_code, resp.text[:500])
             )
-        # Windmill returns the job UUID as a plain quoted string
         job_id = resp.text.strip().strip('"')
         return job_id, metaflow_run_id
     except Exception as exc:
@@ -500,18 +513,26 @@ def _trigger_job(
         raise WindmillException("Failed to trigger job: %s" % exc) from exc
 
 
-def _wait_for_job(
-    client, workspace: str, job_id: str, obj, poll_interval: int = 3
-):
+def _trigger_job(client: WindmillClient, flow_path: str, inputs: dict = None) -> tuple:
+    """Trigger a Windmill flow job via a WindmillClient."""
+    return trigger_windmill_flow(
+        host=client.host,
+        token=client.session.headers.get("Authorization", "").replace("Bearer ", ""),
+        workspace=client.workspace,
+        flow_path=flow_path,
+        inputs=inputs,
+    )
+
+
+def _wait_for_job(client: WindmillClient, job_id: str, obj, poll_interval: int = 3):
     """Poll until the job reaches a terminal state. Returns (success, state)."""
-    host = client._windmill_host
-    url = "%s/api/w/%s/jobs_u/get/%s" % (host, workspace, job_id)
+    url = "%s/api/w/%s/jobs_u/get/%s" % (client.host, client.workspace, job_id)
 
     seen_running = False
 
     while True:
         try:
-            resp = client.get(url, headers={"Content-Type": None})
+            resp = client.session.get(url, headers={"Content-Type": None})
             if resp.status_code == 200:
                 data = resp.json()
                 job_type = data.get("type", "")
