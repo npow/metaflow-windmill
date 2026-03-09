@@ -162,7 +162,13 @@ class WindmillTriggeredRun(TriggeredRun):
                 # LocalStorage.datastore_root and verifies the .metaflow dir exists.
                 # This bypasses any class-level datastore_root caching issues.
                 if sysroot and meta_type == "local":
-                    metaflow.metadata("local@%s" % sysroot)
+                    # Use "local@path" to call compute_info() which properly sets
+                    # LocalStorage.datastore_root. Only works when .metaflow exists.
+                    mf_dir = os.path.join(sysroot, ".metaflow")
+                    if os.path.isdir(mf_dir):
+                        metaflow.metadata("local@%s" % sysroot)
+                    else:
+                        metaflow.metadata(meta_type)
                 else:
                     metaflow.metadata(meta_type)
 
