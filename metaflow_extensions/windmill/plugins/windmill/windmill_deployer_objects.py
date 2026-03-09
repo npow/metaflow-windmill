@@ -58,6 +58,7 @@ class WindmillTriggeredRun(TriggeredRun):
         super().__init__(deployer, content)
         self._content = json.loads(content)
         self._metadata_configured = False
+        self._debug_logged = False
 
     @property
     def _metadata(self) -> dict:
@@ -128,6 +129,22 @@ class WindmillTriggeredRun(TriggeredRun):
             run_dir = os.path.join(sysroot, ".metaflow", flow_name, run_id)
             if os.path.isdir(run_dir):
                 return pathspec
+            # Debug: log what we're looking for vs what exists
+            flow_dir = os.path.join(sysroot, ".metaflow", flow_name)
+            if not self._debug_logged:
+                import sys as _sys
+                print(
+                    "[_resolve_pathspec] pathspec=%r, run_dir exists=%s, "
+                    "flow_dir exists=%s, flow_dir contents=%s"
+                    % (
+                        pathspec,
+                        os.path.isdir(run_dir),
+                        os.path.isdir(flow_dir),
+                        os.listdir(flow_dir) if os.path.isdir(flow_dir) else "N/A",
+                    ),
+                    file=_sys.stderr,
+                )
+                self._debug_logged = True
 
         # Flow name might be wrong (e.g. "UNKNOWN"). Scan the sysroot.
         if sysroot and run_id:
@@ -155,6 +172,22 @@ class WindmillTriggeredRun(TriggeredRun):
         try:
             return metaflow.Run(pathspec, _namespace_check=False)
         except MetaflowNotFound:
+            # Debug: log what we tried and what exists on disk
+            sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")
+            if sysroot:
+                mf_root = os.path.join(sysroot, ".metaflow")
+                import sys as _sys
+                print(
+                    "[WindmillTriggeredRun.run] MetaflowNotFound for pathspec=%r, "
+                    "sysroot=%r, .metaflow exists=%s, contents=%s"
+                    % (
+                        pathspec,
+                        sysroot,
+                        os.path.isdir(mf_root),
+                        os.listdir(mf_root) if os.path.isdir(mf_root) else "N/A",
+                    ),
+                    file=_sys.stderr,
+                )
             return None
 
     # ------------------------------------------------------------------
