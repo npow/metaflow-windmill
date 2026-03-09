@@ -219,13 +219,29 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ""
           PYTHONPATH: ${{ github.workspace }}/metaflow-src
         run: |
-          python -m pytest \
-            metaflow-src/test/ux/core/test_basic.py \
-            -k "${{ matrix.test }} and deployer" \
-            --only-backend windmill \
-            --timeout=300 \
-            -v \
-            --tb=long
+          # Pitfall #26: Windmill runs as root → artifacts are root-owned (chmod 600).
+          # GHA runner user can't read them → metaflow.Run() raises PermissionError
+          # caught as MetaflowNotFound → status stays PENDING forever.
+          # Fix: run pytest as root (GHA has passwordless sudo).
+          sudo -E env \
+            "PATH=$PATH" \
+            "HOME=$HOME" \
+            "METAFLOW_DEFAULT_METADATA=local" \
+            "METAFLOW_DEFAULT_DATASTORE=local" \
+            "METAFLOW_DATASTORE_SYSROOT_LOCAL=/tmp/mf-windmill-test" \
+            "METAFLOW_PROFILE=" \
+            "METAFLOW_HOME=/tmp/mf-windmill-test" \
+            "AWS_SHARED_CREDENTIALS_FILE=" \
+            "AWS_ACCESS_KEY_ID=" \
+            "AWS_SECRET_ACCESS_KEY=" \
+            "PYTHONPATH=${{ github.workspace }}/metaflow-src" \
+            python -m pytest \
+              metaflow-src/test/ux/core/test_basic.py \
+              -k "${{ matrix.test }} and deployer" \
+              --only-backend windmill \
+              --timeout=300 \
+              -v \
+              --tb=long
 
       - name: Dump Windmill worker logs (on failure)
         if: failure()
