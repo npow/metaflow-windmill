@@ -123,16 +123,18 @@ jobs:
 
       - name: Pre-install metaflow in Windmill worker container
         run: |
-          # Install metaflow + deps in the worker container so step scripts can import it.
-          # Newer Debian/Ubuntu (22.04+, PEP 668) prevents system-wide pip installs
-          # without --break-system-packages. Use it explicitly.
-          MF_SRC="${{ github.workspace }}/metaflow-src"
+          # Install OSS metaflow from PyPI (NOT the source tree).
+          # Using source (npow/corral-devstack) would load Netflix-internal plugins
+          # (e.g. 'service' metadata provider) that don't exist in the worker,
+          # causing: ValueError: Cannot locate metadata_provider plugin 'service'.
+          # PyPI metaflow is OSS-only and works cleanly in the container.
+          # --break-system-packages needed on Ubuntu 22.04+ (PEP 668).
           for i in $(seq 1 30); do
             if docker exec windmill_worker sh -c "
-              python3 -m pip install --break-system-packages -q -e '$MF_SRC' 2>&1 || \
-              python3 -m pip install -q -e '$MF_SRC' 2>&1
+              python3 -m pip install --break-system-packages -q 'metaflow>=2.9' 2>&1 || \
+              python3 -m pip install -q 'metaflow>=2.9' 2>&1
             "; then
-              echo "metaflow installed in worker container from $MF_SRC"
+              echo "metaflow installed in worker container from PyPI"
               break
             fi
             echo "Waiting for worker container ($i/30)..."
@@ -140,7 +142,7 @@ jobs:
           done
           # Verify installation
           docker exec windmill_worker python3 -c "import metaflow; print('metaflow', metaflow.__version__)" || \
-            echo "WARNING: metaflow import failed in worker container (will use PYTHONPATH fallback in scripts)"
+            echo "WARNING: metaflow import failed in worker container"
 
       - name: Wait for Windmill to be ready
         run: |

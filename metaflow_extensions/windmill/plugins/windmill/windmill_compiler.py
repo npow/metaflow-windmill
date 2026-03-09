@@ -361,24 +361,13 @@ class WindmillCompiler:
                 key.startswith("METAFLOW_DEFAULT") and key not in env
             ):
                 env[key] = val
-        # Forward PYTHONPATH so Windmill workers can find metaflow source.
-        # When running locally, PYTHONPATH may contain the metaflow source path.
-        # We filter to only include paths that contain a 'metaflow' package
-        # (the OSS source) and exclude paths that would load NFLX-internal
-        # extensions that aren't available in the Windmill worker container.
-        current_pythonpath = os.environ.get("PYTHONPATH", "")
-        if current_pythonpath:
-            import sys
-            filtered_paths = []
-            for p in current_pythonpath.split(os.pathsep):
-                if not p:
-                    continue
-                # Include paths that contain the metaflow package itself
-                mf_pkg = os.path.join(p, "metaflow", "__init__.py")
-                if os.path.isfile(mf_pkg):
-                    filtered_paths.append(p)
-            if filtered_paths:
-                env["PYTHONPATH"] = os.pathsep.join(filtered_paths)
+        # DO NOT forward PYTHONPATH to Windmill worker step scripts.
+        # If PYTHONPATH points to a metaflow source tree (e.g., npow/corral-devstack),
+        # it may contain internal mfextinit_*.py files that register plugins
+        # (like 'service' metadata provider) not available in the worker container.
+        # This causes ValueError: Cannot locate metadata_provider plugin 'service'.
+        # The worker uses pip-installed metaflow (from PyPI) which has only OSS plugins.
+        # Pitfall #34: never forward internal metadata types or source paths to containers.
         return env
 
     def _env_export_lines(self) -> str:
