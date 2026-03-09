@@ -123,24 +123,25 @@ jobs:
 
       - name: Pre-install metaflow in Windmill worker container
         run: |
-          # Install OSS metaflow from PyPI (NOT the source tree).
-          # Using source (npow/corral-devstack) would load Netflix-internal plugins
-          # (e.g. 'service' metadata provider) that don't exist in the worker,
+          # The Windmill container has python3 but no pip (system python has no pip module).
+          # Install pip first, then install OSS metaflow from PyPI.
+          # NOT using source (npow/corral-devstack) — it loads Netflix-internal plugins
           # causing: ValueError: Cannot locate metadata_provider plugin 'service'.
-          # PyPI metaflow is OSS-only and works cleanly in the container.
-          # --break-system-packages needed on Ubuntu 22.04+ (PEP 668).
           for i in $(seq 1 30); do
-            if docker exec windmill_worker sh -c "
+            if docker exec windmill_worker bash -c "
+              # Install pip if missing
+              python3 -c 'import pip' 2>/dev/null || \
+                apt-get install -y -q python3-pip 2>&1 || true
+              # Install metaflow from PyPI (OSS-only, no internal plugins)
               python3 -m pip install --break-system-packages -q 'metaflow>=2.9' 2>&1 || \
               python3 -m pip install -q 'metaflow>=2.9' 2>&1
             "; then
-              echo "metaflow installed in worker container from PyPI"
+              echo "metaflow installed in worker container"
               break
             fi
             echo "Waiting for worker container ($i/30)..."
             sleep 2
           done
-          # Verify installation
           docker exec windmill_worker python3 -c "import metaflow; print('metaflow', metaflow.__version__)" || \
             echo "WARNING: metaflow import failed in worker container"
 
