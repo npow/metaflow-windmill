@@ -66,12 +66,22 @@ def _make_stub_deployer(name: str):
 class WindmillTriggeredRun(TriggeredRun):
     """A Windmill job that was triggered via the Deployer API."""
 
+    def __init__(self, deployer, content: str):
+        super().__init__(deployer, content)
+        # Store the full content dict — the base class only keeps pathspec/name/metadata.
+        # We need job_id/job_url for Windmill API queries.
+        self._content = json.loads(content)
+
+    @property
+    def _metadata(self) -> dict:
+        """Return the full content dict (includes job_id, job_url, etc.)."""
+        return self._content
+
     @property
     def windmill_ui(self) -> Optional[str]:
         """URL to the Windmill UI for this job, if available."""
         try:
-            metadata = self._metadata
-            return metadata.get("job_url")
+            return self._metadata.get("job_url")
         except Exception:
             pass
         return None
@@ -244,15 +254,44 @@ except Exception as e:
             else:
                 os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = old_sysroot
 
+    def _find_actual_run_dir(self, sysroot: str, flow_name: str) -> Optional[str]:
+        """Find the actual run directory on disk when pre-computed run_id doesn't match.
+
+        Windmill's input_transforms may not pass METAFLOW_RUN_ID to the init script,
+        causing it to generate a different run_id. Scan the sysroot for the most recent
+        windmill-* run under this flow.
+        """
+        flow_dir = os.path.join(sysroot, ".metaflow", flow_name)
+        if not os.path.isdir(flow_dir):
+            return None
+        candidates = []
+        for entry in os.listdir(flow_dir):
+            if entry.startswith("windmill-"):
+                entry_path = os.path.join(flow_dir, entry)
+                if os.path.isdir(entry_path):
+                    try:
+                        mtime = os.path.getmtime(entry_path)
+                    except OSError:
+                        mtime = 0
+                    candidates.append((mtime, entry))
+        if not candidates:
+            return None
+        # Return the most recently modified run
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+
     def _check_sysroot_completion(self) -> Optional[str]:
         """Bypass metaflow.Run() and check the sysroot directly for run completion.
 
         This handles cases where metaflow.Run() fails due to class-level caching of
-        LocalStorage.datastore_root across test runs in the same pytest session.
-        Checks for 0.DONE.lock in the end step directory as a completion signal.
+        LocalStorage.datastore_root across test runs in the same pytest session,
+        or when the pre-computed METAFLOW_RUN_ID doesn't match the actual run_id
+        (Windmill input_transforms may not pass it through correctly).
         """
         env_vars = getattr(self.deployer, "env_vars", {}) or {}
         sysroot = env_vars.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
+        if not sysroot:
+            sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
         if not sysroot:
             return None
         pathspec = self.pathspec
@@ -260,8 +299,22 @@ except Exception as e:
             return None
         flow_name, run_id = pathspec.split("/", 1)
         run_dir = os.path.join(sysroot, ".metaflow", flow_name, run_id)
+
+        # If the expected run_dir doesn't exist, scan for the actual run_id.
+        # This handles the case where METAFLOW_RUN_ID wasn't passed through
+        # Windmill's input_transforms to the init module.
+        if not os.path.isdir(run_dir):
+            actual_run_id = self._find_actual_run_dir(sysroot, flow_name)
+            if actual_run_id and actual_run_id != run_id:
+                run_dir = os.path.join(sysroot, ".metaflow", flow_name, actual_run_id)
+                # Update pathspec so subsequent calls use the correct run_id
+                self.pathspec = "%s/%s" % (flow_name, actual_run_id)
+            else:
+                return None
+
         if not os.path.isdir(run_dir):
             return None
+
         # Check if end step completed via 0.DONE.lock or 0.task_end
         import glob
         done_patterns = [

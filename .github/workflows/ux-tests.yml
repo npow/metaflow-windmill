@@ -247,9 +247,9 @@ jobs:
         if: failure()
         run: |
           echo "=== Windmill worker logs ==="
-          docker logs --tail=100 windmill_worker 2>&1 || echo "(no worker logs)"
+          docker logs --tail=200 windmill_worker 2>&1 || echo "(no worker logs)"
           echo "=== Windmill server logs ==="
-          docker logs --tail=50 windmill_server 2>&1 || echo "(no server logs)"
+          docker logs --tail=100 windmill_server 2>&1 || echo "(no server logs)"
           echo "=== Metaflow sysroot tree ==="
           sudo find /tmp/mf-windmill-test -ls 2>/dev/null || echo "(sysroot empty)"
 
