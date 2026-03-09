@@ -250,8 +250,26 @@ jobs:
           docker logs --tail=200 windmill_worker 2>&1 || echo "(no worker logs)"
           echo "=== Windmill server logs ==="
           docker logs --tail=100 windmill_server 2>&1 || echo "(no server logs)"
-          echo "=== Metaflow sysroot tree ==="
-          sudo find /tmp/mf-windmill-test -ls 2>/dev/null || echo "(sysroot empty)"
+          echo "=== Metaflow sysroot tree (host) ==="
+          sudo find /tmp/mf-windmill-test -ls 2>/dev/null || echo "(sysroot empty on host)"
+          echo "=== Metaflow sysroot tree (inside worker container) ==="
+          docker exec windmill_worker find /tmp/mf-windmill-test -ls 2>/dev/null || echo "(sysroot empty in container)"
+          echo "=== Windmill python3 path in worker ==="
+          docker exec windmill_worker which python3 2>/dev/null || echo "(no python3)"
+          docker exec windmill_worker python3 -c "import metaflow; print('metaflow OK:', metaflow.__version__)" 2>&1 || echo "(metaflow not importable)"
+          echo "=== Windmill completed jobs (last 10) ==="
+          curl -sf -H "Authorization: Bearer ${{ steps.windmill_token.outputs.token }}" \
+            "http://localhost:8000/api/w/admins/jobs/completed/list?per_page=10&order_desc=true" 2>/dev/null | python3 -m json.tool 2>/dev/null | head -200 || echo "(could not list jobs)"
+          echo "=== Last flow job result ==="
+          # Find the most recent flow job and dump its result + logs
+          FLOW_JOB=$(curl -sf -H "Authorization: Bearer ${{ steps.windmill_token.outputs.token }}" \
+            "http://localhost:8000/api/w/admins/jobs/completed/list?per_page=5&order_desc=true" 2>/dev/null \
+            | python3 -c "import sys,json; jobs=json.load(sys.stdin); print(next((j['id'] for j in jobs if j.get('job_kind')=='flow'), 'none'))" 2>/dev/null) || true
+          if [ -n "$FLOW_JOB" ] && [ "$FLOW_JOB" != "none" ]; then
+            echo "Flow job ID: $FLOW_JOB"
+            curl -sf -H "Authorization: Bearer ${{ steps.windmill_token.outputs.token }}" \
+              "http://localhost:8000/api/w/admins/jobs_u/get/$FLOW_JOB" 2>/dev/null | python3 -m json.tool 2>/dev/null | head -100 || true
+          fi
 
       - name: Upload coverage
         if: always()
