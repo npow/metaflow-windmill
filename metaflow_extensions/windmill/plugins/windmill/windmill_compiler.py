@@ -13,7 +13,7 @@ Supported Metaflow graph patterns:
 
 The compiled flow runs each Metaflow step via bash:
   python flow.py --no-pylint step <step_name>
-      --run-id $RUN_ID --task-id 1 --retry-count ${WM_FLOW_RETRY_COUNT:-0}
+      --run-id $RUN_ID --task-id windmill-1 --retry-count ${WM_FLOW_RETRY_COUNT:-0}
 
 where WM_FLOW_RETRY_COUNT comes from Windmill's native retry mechanism.
 """
@@ -555,18 +555,22 @@ echo "Initialized Metaflow run: $RUN_ID"
 
         # Compute --input-paths for this step.
         # In OSS Metaflow local storage:
-        #   start step input: $RUN_ID/_parameters/1  (from init)
-        #   other steps:      $RUN_ID/{parent_step}/1
-        #   join steps:       comma-separated list of $RUN_ID/{parent}/1 for each parent
+        #   start step input: $RUN_ID/_parameters/windmill-params  (from init)
+        #   other steps:      $RUN_ID/{parent_step}/windmill-1
+        #   join steps:       comma-separated list for each parent
+        #
+        # Task IDs use non-integer format (windmill-N) so that the local
+        # metadata provider's register_task_id() calls _new_task() which
+        # creates the step-level _meta/_self.json required by metaflow.Run().
         in_funcs = list(node.in_funcs)
         if node.name == "start":
             input_paths_expr = '"$RUN_ID/_parameters/windmill-params"'
         elif len(in_funcs) == 1:
             parent = in_funcs[0]
-            input_paths_expr = '"$RUN_ID/%s/1"' % parent
+            input_paths_expr = '"$RUN_ID/%s/windmill-1"' % parent
         else:
             # Multiple parents (join step)
-            parent_paths = ",".join("$RUN_ID/%s/1" % p for p in in_funcs)
+            parent_paths = ",".join("$RUN_ID/%s/windmill-1" % p for p in in_funcs)
             input_paths_expr = '"%s"' % parent_paths
 
         # The RUN_ID is shared via /tmp file since same_worker=True ensures
@@ -599,7 +603,7 @@ RETRY_COUNT="${{WM_FLOW_RETRY_COUNT:-0}}"
 
 INPUT_PATHS={input_paths_expr}
 
-{step_cmd} --run-id "$RUN_ID" --task-id 1 --retry-count "$RETRY_COUNT" --input-paths "$INPUT_PATHS" {extra_args}
+{step_cmd} --run-id "$RUN_ID" --task-id windmill-1 --retry-count "$RETRY_COUNT" --input-paths "$INPUT_PATHS" {extra_args}
 '''.format(
             env_exports=env_exports,
             step_cmd=step_base_cmd,
@@ -704,12 +708,10 @@ INPUT_PATHS={input_paths_expr}
 
         body_in_funcs = list(body_node.in_funcs)
         if len(body_in_funcs) == 1:
-            body_input_paths_expr = '"$RUN_ID/%s/$SPLIT_INDEX"' % body_in_funcs[0]
+            body_input_paths_expr = '"$RUN_ID/%s/windmill-$SPLIT_INDEX"' % body_in_funcs[0]
         else:
-            # Multiple parents (join of multiple foreachs) — rare but handle it.
-            # Use SPLIT_INDEX for task ID of each parent.
             body_input_paths_expr = '"' + ",".join(
-                "$RUN_ID/%s/$SPLIT_INDEX" % p for p in body_in_funcs
+                "$RUN_ID/%s/windmill-$SPLIT_INDEX" % p for p in body_in_funcs
             ) + '"'
 
         body_script = '''\
@@ -736,7 +738,7 @@ RETRY_COUNT="${{WM_FLOW_RETRY_COUNT:-0}}"
 SPLIT_INDEX="${{WM_ITERATION_INDEX:-0}}"
 INPUT_PATHS={body_input_paths_expr}
 
-{step_cmd} --run-id "$RUN_ID" --task-id "$SPLIT_INDEX" --retry-count "$RETRY_COUNT" --split-index "$SPLIT_INDEX" --input-paths "$INPUT_PATHS"
+{step_cmd} --run-id "$RUN_ID" --task-id "windmill-$SPLIT_INDEX" --retry-count "$RETRY_COUNT" --split-index "$SPLIT_INDEX" --input-paths "$INPUT_PATHS"
 '''.format(
             env_exports=env_exports,
             step_cmd=step_base_cmd,
@@ -823,9 +825,9 @@ INPUT_PATHS={body_input_paths_expr}
             input_paths_expr = '"$RUN_ID/_parameters/windmill-params"'
         elif len(in_funcs) == 1:
             parent = in_funcs[0]
-            input_paths_expr = '"$RUN_ID/%s/1"' % parent
+            input_paths_expr = '"$RUN_ID/%s/windmill-1"' % parent
         else:
-            parent_paths = ",".join("$RUN_ID/%s/1" % p for p in in_funcs)
+            parent_paths = ",".join("$RUN_ID/%s/windmill-1" % p for p in in_funcs)
             input_paths_expr = '"%s"' % parent_paths
 
         # After the step runs, read the _transition artifact to find the chosen branch.
@@ -844,7 +846,7 @@ INPUT_PATHS={body_input_paths_expr}
             "impl = next(d for d in DATASTORES if d.TYPE == 'local'); "
             "fds = FlowDataStore('%s', None, storage_impl=impl, "
             "ds_root=os.path.join(root, '.metaflow')); "
-            "tds = fds.get_task_datastore(run_id, '%s', '1', attempt=0, mode='r'); "
+            "tds = fds.get_task_datastore(run_id, '%s', 'windmill-1', attempt=0, mode='r'); "
             "tr = tds['_transition']; "
             "branch = tr[0][0] if tr and tr[0] else 'unknown'; "
             "print(json.dumps({'branch': branch}))"
@@ -878,7 +880,7 @@ RETRY_COUNT="${{WM_FLOW_RETRY_COUNT:-0}}"
 
 INPUT_PATHS={input_paths_expr}
 
-{step_cmd} --run-id "$RUN_ID" --task-id 1 --retry-count "$RETRY_COUNT" --input-paths "$INPUT_PATHS"
+{step_cmd} --run-id "$RUN_ID" --task-id windmill-1 --retry-count "$RETRY_COUNT" --input-paths "$INPUT_PATHS"
 
 # Read the chosen branch from the Metaflow datastore and output as JSON
 # so that the branchone module can pick the correct branch at runtime.
