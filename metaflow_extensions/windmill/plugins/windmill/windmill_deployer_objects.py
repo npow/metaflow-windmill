@@ -168,6 +168,15 @@ class WindmillTriggeredRun(TriggeredRun):
                     pathspec = "%s/%s" % (flow_name, run_id)
                     self.pathspec = pathspec
 
+            # Force-set LocalStorage.datastore_root to bypass class-level caching
+            # issue where a previous call may have set it to the wrong value.
+            if sysroot:
+                try:
+                    from metaflow.plugins.datastores.local_storage import LocalStorage
+                    LocalStorage.datastore_root = os.path.join(sysroot, ".metaflow")
+                except Exception:
+                    pass
+
             # Try the direct pathspec first
             try:
                 run = metaflow.Run(pathspec, _namespace_check=False)
