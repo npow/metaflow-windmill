@@ -17,31 +17,19 @@ if TYPE_CHECKING:
     import metaflow.runner.deployer_impl
 
 
-def _find_flow_for_run_id(run_id: str) -> Optional[str]:
-    """Scan the local Metaflow datastore to find which flow class owns run_id."""
-    try:
-        import metaflow as _mf
-        _mf.namespace(None)
-        sysroot = (
-            os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
-            or os.path.expanduser("~")
-        )
-        mf_root = os.path.join(sysroot, ".metaflow")
-        if not os.path.isdir(mf_root):
-            return None
-        for entry in os.listdir(mf_root):
-            flow_dir = os.path.join(mf_root, entry)
-            if os.path.isdir(flow_dir) and os.path.isdir(
-                os.path.join(flow_dir, run_id)
-            ):
-                return entry
-    except Exception:
-        pass
+def _find_flow_for_run_id(sysroot: str, run_id: str) -> Optional[str]:
+    """Scan the local datastore to find which flow owns *run_id*."""
+    mf_root = os.path.join(sysroot, ".metaflow")
+    if not os.path.isdir(mf_root):
+        return None
+    for entry in os.listdir(mf_root):
+        if os.path.isdir(os.path.join(mf_root, entry, run_id)):
+            return entry
     return None
 
 
 def _make_stub_deployer(name: str):
-    """Return a minimal deployer stub for Windmill recovered without a flow file."""
+    """Return a minimal deployer stub for recovery without a flow file."""
     from .windmill_deployer import WindmillDeployer
 
     stub = object.__new__(WindmillDeployer)
@@ -68,304 +56,147 @@ class WindmillTriggeredRun(TriggeredRun):
 
     def __init__(self, deployer, content: str):
         super().__init__(deployer, content)
-        # Store the full content dict — the base class only keeps pathspec/name/metadata.
-        # We need job_id/job_url for Windmill API queries.
         self._content = json.loads(content)
+        self._metadata_configured = False
 
     @property
     def _metadata(self) -> dict:
-        """Return the full content dict (includes job_id, job_url, etc.)."""
         return self._content
 
     @property
     def windmill_ui(self) -> Optional[str]:
-        """URL to the Windmill UI for this job, if available."""
-        try:
-            return self._metadata.get("job_url")
-        except Exception:
-            pass
-        return None
+        """URL to the Windmill UI for this job."""
+        return self._metadata.get("job_url")
 
-    def _resolve_run_id_from_windmill(self) -> Optional[str]:
-        """Query the Windmill API to find the actual Metaflow run_id.
+    # ------------------------------------------------------------------
+    # Metadata setup — called once, sets env vars permanently.
+    #
+    # The key insight: metaflow.Run() uses lazy evaluation. When the
+    # caller accesses run.finished or run.successful, the Metaflow client
+    # reads data from the local datastore at that moment. If we
+    # save/restore env vars around Run() creation, the lazy reads happen
+    # after restore — with the WRONG datastore path. So we set the env
+    # vars once and leave them set.
+    # ------------------------------------------------------------------
 
-        The init module prints the RUN_ID as its last stdout line (the module result).
-        We find the init module's job and read its result to get the actual run_id.
-        """
-        try:
-            import requests
+    def _ensure_metadata(self):
+        """Configure local metadata provider to point at the deployer's sysroot."""
+        if self._metadata_configured:
+            return
+        self._metadata_configured = True
 
-            metadata = self._metadata
-            job_id = metadata.get("job_id")
-            if not job_id:
-                return None
-
-            additional_info = getattr(self.deployer, "additional_info", {}) or {}
-            windmill_host = additional_info.get("windmill_host", "http://localhost:8000")
-            windmill_token = additional_info.get("windmill_token", "")
-            windmill_workspace = additional_info.get("windmill_workspace", "admins")
-
-            session = requests.Session()
-            if windmill_token:
-                session.headers["Authorization"] = "Bearer %s" % windmill_token
-
-            # Get the flow job to find the init module job
-            job_url = "%s/api/w/%s/jobs_u/get/%s" % (
-                windmill_host, windmill_workspace, job_id
-            )
-            resp = session.get(job_url)
-            if resp.status_code != 200:
-                return None
-            job_data = resp.json()
-
-            # Find the metaflow_init module job
-            modules = job_data.get("flow_status", {}).get("modules", [])
-            init_job_id = None
-            for m in modules:
-                if m.get("id") == "metaflow_init" and m.get("job"):
-                    init_job_id = m["job"]
-                    break
-
-            if not init_job_id:
-                return None
-
-            # Get the init job result (last stdout line = the RUN_ID)
-            init_url = "%s/api/w/%s/jobs_u/get/%s" % (
-                windmill_host, windmill_workspace, init_job_id
-            )
-            resp = session.get(init_url)
-            if resp.status_code != 200:
-                return None
-            init_data = resp.json()
-
-            result = init_data.get("result", "")
-            if isinstance(result, str) and "windmill-" in result:
-                # The init module last line is e.g.:
-                # "Initialized Metaflow run: windmill-<uuid>" (from our echo)
-                # OR just "windmill-<uuid>" if the echo IS the last line
-                idx = result.rfind("windmill-")
-                run_id_candidate = result[idx:].strip()
-                if run_id_candidate.startswith("windmill-"):
-                    return run_id_candidate
-        except Exception:
-            pass
-        return None
-
-    @property
-    def run(self):
-        """Retrieve the Run object, applying deployer env vars so local metadata works."""
         env_vars = getattr(self.deployer, "env_vars", {}) or {}
+        sysroot = env_vars.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
         meta_type = env_vars.get("METAFLOW_DEFAULT_METADATA")
-        sysroot = env_vars.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
 
-        old_meta = os.environ.get("METAFLOW_DEFAULT_METADATA")
-        old_sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
-        try:
-            if meta_type == "local" and sysroot is None:
-                sysroot = os.path.expanduser("~")
-            # Set sysroot FIRST so metaflow.metadata() picks it up correctly
-            if sysroot:
-                os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
-            if meta_type:
-                os.environ["METAFLOW_DEFAULT_METADATA"] = meta_type
-                # Use "local@path" form to call compute_info() which properly sets
-                # LocalStorage.datastore_root and verifies the .metaflow dir exists.
-                # This bypasses any class-level datastore_root caching issues.
-                if sysroot and meta_type == "local":
-                    # Use "local@path" to call compute_info() which properly sets
-                    # LocalStorage.datastore_root. Only works when .metaflow exists.
-                    mf_dir = os.path.join(sysroot, ".metaflow")
-                    if os.path.isdir(mf_dir):
-                        metaflow.metadata("local@%s" % sysroot)
-                    else:
-                        metaflow.metadata(meta_type)
-                else:
-                    metaflow.metadata(meta_type)
+        if meta_type == "local" and not sysroot:
+            sysroot = os.path.expanduser("~")
 
-            pathspec = self.pathspec
-            if pathspec and pathspec.startswith("UNKNOWN/"):
-                run_id = pathspec.split("/", 1)[1]
-                flow_name = _find_flow_for_run_id(run_id)
-                if flow_name:
-                    pathspec = "%s/%s" % (flow_name, run_id)
-                    self.pathspec = pathspec
+        if sysroot:
+            os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
+        if meta_type:
+            os.environ["METAFLOW_DEFAULT_METADATA"] = meta_type
 
-            # Try the direct pathspec first
-            try:
-                run = metaflow.Run(pathspec, _namespace_check=False)
-                # Verify the run actually has data (a Run can be created as a stub
-                # without raising, but step access silently fails if the flow name
-                # in the pathspec doesn't match the datastore directory).
-                try:
-                    list(run.steps)
-                    return run
-                except Exception:
-                    # Flow name mismatch — fall through to correction below
-                    pass
-            except MetaflowNotFound:
-                pass
-
-            # The flow name in pathspec might be wrong (e.g., missing @project prefix
-            # like "project.branch.FlowName").  Scan the sysroot for the run_id.
-            if sysroot:
-                run_id = pathspec.split("/", 1)[1] if "/" in pathspec else pathspec
-                actual_flow = _find_flow_for_run_id(run_id)
-                if actual_flow:
-                    corrected = "%s/%s" % (actual_flow, run_id)
-                    if corrected != pathspec:
-                        self.pathspec = corrected
-                        pathspec = corrected
-                        try:
-                            run = metaflow.Run(corrected, _namespace_check=False)
-                            return run
-                        except MetaflowNotFound:
-                            pass
-
-            # Fallback: use fresh subprocess to verify run exists (bypasses any
-            # class-level LocalStorage.datastore_root caching in this process).
-            # If subprocess finds run, retry in this process.
-            if sysroot:
-                import subprocess as _sp
-                _check = _sp.run(
-                    [__import__("sys").executable, "-c", """
-import os, sys
-os.environ['METAFLOW_DEFAULT_DATASTORE'] = 'local'
-os.environ['METAFLOW_DEFAULT_METADATA'] = 'local'
-os.environ['METAFLOW_DATASTORE_SYSROOT_LOCAL'] = sys.argv[1]
-from metaflow.plugins.datastores.local_storage import LocalStorage
-LocalStorage.datastore_root = None
-import metaflow
-try:
-    metaflow.metadata('local@' + sys.argv[1])
-    r = metaflow.Run(sys.argv[2], _namespace_check=False)
-    print('ok:' + sys.argv[2])
-except Exception as e:
-    print('err:' + str(e)[:100])
-""", sysroot, pathspec],
-                    capture_output=True, text=True, timeout=10
-                )
-                if _check.stdout.strip().startswith("ok:"):
-                    # Subprocess found it — retry with fresh local@path metadata setup
-                    metaflow.metadata("local@%s" % sysroot)
-                    try:
-                        run = metaflow.Run(pathspec, _namespace_check=False)
-                        return run
-                    except Exception:
-                        pass
-
-            # Pathspec not found - query Windmill to find the actual run_id
-            actual_run_id = self._resolve_run_id_from_windmill()
-            if actual_run_id:
-                # Always try to resolve the flow name from the sysroot
-                flow_name = _find_flow_for_run_id(actual_run_id)
-                if not flow_name:
-                    flow_name = pathspec.split("/")[0]
-                new_pathspec = "%s/%s" % (flow_name, actual_run_id)
-                self.pathspec = new_pathspec
-                try:
-                    run = metaflow.Run(new_pathspec, _namespace_check=False)
-                    return run
-                except MetaflowNotFound:
-                    pass
-
-            return None
-        finally:
-            if old_meta is None:
-                os.environ.pop("METAFLOW_DEFAULT_METADATA", None)
+        # "local@path" calls compute_info() which sets LocalStorage.datastore_root.
+        if sysroot and meta_type == "local":
+            mf_dir = os.path.join(sysroot, ".metaflow")
+            if os.path.isdir(mf_dir):
+                metaflow.metadata("local@%s" % sysroot)
             else:
-                os.environ["METAFLOW_DEFAULT_METADATA"] = old_meta
-            if old_sysroot is None:
-                os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
-            else:
-                os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = old_sysroot
+                metaflow.metadata("local")
+        elif meta_type:
+            metaflow.metadata(meta_type)
 
-    def _find_actual_run_dir(self, sysroot: str, flow_name: str) -> Optional[str]:
-        """Find the actual run directory on disk when pre-computed run_id doesn't match.
+        metaflow.namespace(None)
 
-        Windmill's input_transforms may not pass METAFLOW_RUN_ID to the init script,
-        causing it to generate a different run_id. Scan the sysroot for the most recent
-        windmill-* run under this flow.
-        """
-        flow_dir = os.path.join(sysroot, ".metaflow", flow_name)
-        if not os.path.isdir(flow_dir):
-            return None
-        candidates = []
-        for entry in os.listdir(flow_dir):
-            if entry.startswith("windmill-"):
-                entry_path = os.path.join(flow_dir, entry)
-                if os.path.isdir(entry_path):
-                    try:
-                        mtime = os.path.getmtime(entry_path)
-                    except OSError:
-                        mtime = 0
-                    candidates.append((mtime, entry))
-        if not candidates:
-            return None
-        # Return the most recently modified run
-        candidates.sort(reverse=True)
-        return candidates[0][1]
+    # ------------------------------------------------------------------
+    # Pathspec correction — the flow name in the pathspec might not match
+    # the actual directory in the datastore (e.g. UNKNOWN/run_id).
+    # ------------------------------------------------------------------
 
-    def _check_sysroot_completion(self) -> Optional[str]:
-        """Bypass metaflow.Run() and check the sysroot directly for run completion.
-
-        This handles cases where metaflow.Run() fails due to class-level caching of
-        LocalStorage.datastore_root across test runs in the same pytest session,
-        or when the pre-computed METAFLOW_RUN_ID doesn't match the actual run_id
-        (Windmill input_transforms may not pass it through correctly).
-        """
-        env_vars = getattr(self.deployer, "env_vars", {}) or {}
-        sysroot = env_vars.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
-        if not sysroot:
-            sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
-        if not sysroot:
-            return None
+    def _resolve_pathspec(self) -> Optional[str]:
+        """Return a corrected pathspec, or None if the run doesn't exist yet."""
         pathspec = self.pathspec
         if not pathspec or "/" not in pathspec:
             return None
+
+        flow_name, run_id = pathspec.split("/", 1)
+        sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")
+
+        # If the pathspec already points to a real directory, use it.
+        if sysroot:
+            run_dir = os.path.join(sysroot, ".metaflow", flow_name, run_id)
+            if os.path.isdir(run_dir):
+                return pathspec
+
+        # Flow name might be wrong (e.g. "UNKNOWN"). Scan the sysroot.
+        if sysroot and run_id:
+            actual_flow = _find_flow_for_run_id(sysroot, run_id)
+            if actual_flow:
+                corrected = "%s/%s" % (actual_flow, run_id)
+                self.pathspec = corrected
+                return corrected
+
+        return pathspec
+
+    # ------------------------------------------------------------------
+    # The run property — simple: configure metadata, resolve pathspec,
+    # create Run. No save/restore, no subprocess fallback, no Windmill
+    # API fallback.
+    # ------------------------------------------------------------------
+
+    @property
+    def run(self):
+        """Retrieve the metaflow.Run object for this triggered run."""
+        self._ensure_metadata()
+        pathspec = self._resolve_pathspec()
+        if not pathspec:
+            return None
+        try:
+            return metaflow.Run(pathspec, _namespace_check=False)
+        except MetaflowNotFound:
+            return None
+
+    # ------------------------------------------------------------------
+    # Filesystem-based completion check. Used as fallback in status when
+    # metaflow.Run() isn't available yet (data hasn't landed).
+    # ------------------------------------------------------------------
+
+    def _check_sysroot_completion(self) -> Optional[str]:
+        """Check the local datastore directly for run completion."""
+        import glob
+
+        sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "")
+        if not sysroot:
+            return None
+
+        pathspec = self.pathspec
+        if not pathspec or "/" not in pathspec:
+            return None
+
         flow_name, run_id = pathspec.split("/", 1)
         run_dir = os.path.join(sysroot, ".metaflow", flow_name, run_id)
-
-        # If the expected run_dir doesn't exist, scan for the actual run_id.
-        # This handles the case where METAFLOW_RUN_ID wasn't passed through
-        # Windmill's input_transforms to the init module.
-        if not os.path.isdir(run_dir):
-            actual_run_id = self._find_actual_run_dir(sysroot, flow_name)
-            if actual_run_id and actual_run_id != run_id:
-                run_dir = os.path.join(sysroot, ".metaflow", flow_name, actual_run_id)
-                # Update pathspec so subsequent calls use the correct run_id
-                self.pathspec = "%s/%s" % (flow_name, actual_run_id)
-            else:
-                return None
-
         if not os.path.isdir(run_dir):
             return None
 
-        # Check if end step completed via 0.DONE.lock or 0.task_end
-        import glob
-        done_patterns = [
+        # Check if end step completed
+        for pattern in [
             os.path.join(run_dir, "end", "*", "0.DONE.lock"),
             os.path.join(run_dir, "end", "*", "0.task_end"),
-        ]
-        for pattern in done_patterns:
+            os.path.join(run_dir, "end", "*", "_meta", "0_artifact__task_ok.json"),
+        ]:
             if glob.glob(pattern):
                 return "SUCCEEDED"
-        # Check for task_ok artifact indicating successful end
-        end_meta = glob.glob(os.path.join(run_dir, "end", "*", "_meta", "0_artifact__task_ok.json"))
-        if end_meta:
-            return "SUCCEEDED"
-        # Run directory exists but end step not done yet
+
         return "RUNNING"
 
     @property
     def status(self) -> Optional[str]:
-        """Return a simple status string based on the underlying Metaflow run."""
+        """Return a status string for this run."""
+        self._ensure_metadata()
         run = self.run
         if run is None:
-            # Fallback: check filesystem directly (avoids metaflow.Run() caching issues)
-            sysroot_status = self._check_sysroot_completion()
-            if sysroot_status:
-                return sysroot_status
-            return "PENDING"
+            return self._check_sysroot_completion() or "PENDING"
         if run.successful:
             return "SUCCEEDED"
         if run.finished:
@@ -390,17 +221,7 @@ class WindmillDeployedFlow(DeployedFlow):
         })
 
     def run(self, **kwargs) -> WindmillTriggeredRun:
-        """Trigger a new execution of this deployed Windmill flow.
-
-        Parameters
-        ----------
-        **kwargs : Any
-            Flow parameters as keyword arguments (e.g. message="hello").
-
-        Returns
-        -------
-        WindmillTriggeredRun
-        """
+        """Trigger a new execution of this deployed Windmill flow."""
         additional_info = getattr(self.deployer, "additional_info", {}) or {}
         flow_file = getattr(self.deployer, "flow_file", "") or ""
 
@@ -455,12 +276,8 @@ class WindmillDeployedFlow(DeployedFlow):
         """Trigger a new execution; alias for run() that also accepts run_params.
 
         REQUIRED (Cap.RUN_PARAMS): run_params must be a list, not a tuple.
-        Click returns tuples for multi-value options; always convert:
-            run_params = list(run_params) if run_params else []
         """
-        # REQUIRED (Cap.RUN_PARAMS): must be list, not tuple — DO NOT REMOVE
         run_params = list(run_params) if run_params else []
-        # Unpack run_params (key=value strings) into kwargs for run()
         for kv in run_params:
             k, _, v = kv.partition("=")
             kwargs.setdefault(k.strip(), v.strip())
@@ -494,8 +311,6 @@ class WindmillDeployedFlow(DeployedFlow):
         url = "%s/api/w/%s/jobs/run/f/%s" % (
             windmill_host, windmill_workspace, flow_path
         )
-        # Pre-compute a stable run_id and pass it to the flow as METAFLOW_RUN_ID
-        # so the init module uses the exact same ID we record in the pathspec.
         run_id = "windmill-" + str(uuid.uuid4()).replace("-", "")[:16]
         payload = {k: str(v) for k, v in kwargs.items()}
         payload["METAFLOW_RUN_ID"] = run_id
@@ -507,16 +322,7 @@ class WindmillDeployedFlow(DeployedFlow):
             )
 
         job_id = resp.text.strip().strip('"')
-
-        # Use the project-decorated flow name (mf_flow_class) stored by the create
-        # command.  With @project, the Metaflow datastore stores runs under
-        # "project.branch.FlowName" not just "FlowName".
-        flow_class_name = (
-            additional_info.get("mf_flow_class")
-            or self.deployer.flow_name
-            or "UNKNOWN"
-        )
-        pathspec = "%s/%s" % (flow_class_name, run_id)
+        pathspec = "%s/%s" % (self.deployer.flow_name or "UNKNOWN", run_id)
 
         content_dict = {
             "pathspec": pathspec,
@@ -567,7 +373,6 @@ class WindmillDeployedFlow(DeployedFlow):
                 if k not in ("name", "flow_name", "flow_file")
             }
         else:
-            # Plain name — fall back to environment variables
             windmill_host = os.environ.get("WINDMILL_HOST", "http://localhost:8000")
             windmill_token = os.environ.get("WINDMILL_TOKEN", "")
             windmill_workspace = os.environ.get("WINDMILL_WORKSPACE", "admins")
