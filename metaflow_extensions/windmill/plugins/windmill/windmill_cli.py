@@ -24,6 +24,31 @@ from .exception import WindmillException, NotSupportedException
 from .windmill_compiler import WindmillCompiler, flow_name_to_path
 
 
+def _effective_flow_name(obj, branch=None, production=False):
+    """Return the project-decorated flow name used by Metaflow in the datastore.
+
+    When @project is applied, the datastore stores runs under
+    ``project.branch.FlowName`` instead of just ``FlowName``.  The pathspec
+    written to the deployer attribute file must use this decorated name so that
+    ``metaflow.Run(pathspec)`` resolves to the correct directory.
+    """
+    try:
+        from metaflow.decorators import flow_decorators
+        for deco in flow_decorators(obj.flow):
+            if deco.name == "project":
+                project_name = deco.attributes.get("name", "")
+                if production:
+                    branch_str = "prod"
+                elif branch:
+                    branch_str = "test.%s" % branch
+                else:
+                    branch_str = "user.%s" % (get_username() or "unknown")
+                return "%s.%s.%s" % (project_name, branch_str, obj.graph.name)
+    except Exception:
+        pass
+    return obj.graph.name
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -168,18 +193,21 @@ def create(
     _deploy_flow(client, windmill_workspace, flow_path, flow_json, obj)
 
     if deployer_attribute_file:
+        # Use the project-decorated flow name for the Metaflow pathspec.
+        # With @project, the datastore uses "project.branch.FlowName" not "FlowName".
+        effective_name = compiler._flow_name
         with open(deployer_attribute_file, "w") as f:
             json.dump(
                 {
                     "name": flow_path,
-                    "flow_name": obj.flow.name,
+                    "flow_name": effective_name,
                     "metadata": "{}",
                     "additional_info": {
                         "flow_path": flow_path,
                         "windmill_host": windmill_host,
                         "windmill_token": windmill_token,
                         "windmill_workspace": windmill_workspace,
-                        "mf_flow_class": obj.flow.name,
+                        "mf_flow_class": effective_name,
                     },
                 },
                 f,
@@ -255,7 +283,10 @@ def trigger(
     obj.echo("Job started: *%s*" % job_url)
 
     if deployer_attribute_file:
-        pathspec = "%s/%s" % (obj.flow.name, metaflow_run_id)
+        # Use the project-decorated flow name for the Metaflow pathspec.
+        # With @project, the datastore uses "project.branch.FlowName" not "FlowName".
+        effective_name = _effective_flow_name(obj)
+        pathspec = "%s/%s" % (effective_name, metaflow_run_id)
         with open(deployer_attribute_file, "w") as f:
             json.dump(
                 {

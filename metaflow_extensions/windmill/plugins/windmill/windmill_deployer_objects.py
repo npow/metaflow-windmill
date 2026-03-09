@@ -193,9 +193,33 @@ class WindmillTriggeredRun(TriggeredRun):
             # Try the direct pathspec first
             try:
                 run = metaflow.Run(pathspec, _namespace_check=False)
-                return run
+                # Verify the run actually has data (a Run can be created as a stub
+                # without raising, but step access silently fails if the flow name
+                # in the pathspec doesn't match the datastore directory).
+                try:
+                    list(run.steps)
+                    return run
+                except Exception:
+                    # Flow name mismatch — fall through to correction below
+                    pass
             except MetaflowNotFound:
                 pass
+
+            # The flow name in pathspec might be wrong (e.g., missing @project prefix
+            # like "project.branch.FlowName").  Scan the sysroot for the run_id.
+            if sysroot:
+                run_id = pathspec.split("/", 1)[1] if "/" in pathspec else pathspec
+                actual_flow = _find_flow_for_run_id(run_id)
+                if actual_flow:
+                    corrected = "%s/%s" % (actual_flow, run_id)
+                    if corrected != pathspec:
+                        self.pathspec = corrected
+                        pathspec = corrected
+                        try:
+                            run = metaflow.Run(corrected, _namespace_check=False)
+                            return run
+                        except MetaflowNotFound:
+                            pass
 
             # Fallback: use fresh subprocess to verify run exists (bypasses any
             # class-level LocalStorage.datastore_root caching in this process).
@@ -232,9 +256,10 @@ except Exception as e:
             # Pathspec not found - query Windmill to find the actual run_id
             actual_run_id = self._resolve_run_id_from_windmill()
             if actual_run_id:
-                flow_name = pathspec.split("/")[0]
-                if flow_name == "UNKNOWN":
-                    flow_name = _find_flow_for_run_id(actual_run_id) or "UNKNOWN"
+                # Always try to resolve the flow name from the sysroot
+                flow_name = _find_flow_for_run_id(actual_run_id)
+                if not flow_name:
+                    flow_name = pathspec.split("/")[0]
                 new_pathspec = "%s/%s" % (flow_name, actual_run_id)
                 self.pathspec = new_pathspec
                 try:
@@ -483,17 +508,14 @@ class WindmillDeployedFlow(DeployedFlow):
 
         job_id = resp.text.strip().strip('"')
 
+        # Use the project-decorated flow name (mf_flow_class) stored by the create
+        # command.  With @project, the Metaflow datastore stores runs under
+        # "project.branch.FlowName" not just "FlowName".
         flow_class_name = (
             additional_info.get("mf_flow_class")
-            or (
-                self.deployer.flow_name
-                if self.deployer.flow_name
-                and "-" not in self.deployer.flow_name
-                else None
-            )
+            or self.deployer.flow_name
+            or "UNKNOWN"
         )
-        if not flow_class_name:
-            flow_class_name = "UNKNOWN"
         pathspec = "%s/%s" % (flow_class_name, run_id)
 
         content_dict = {
