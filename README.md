@@ -1,48 +1,67 @@
 # metaflow-windmill
 
-[Windmill](https://windmill.dev) scheduling and orchestration for [Metaflow](https://metaflow.org).
+[![CI](https://github.com/npow/metaflow-windmill/actions/workflows/ux-tests.yml/badge.svg)](https://github.com/npow/metaflow-windmill/actions/workflows/ux-tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/metaflow-windmill)](https://pypi.org/project/metaflow-windmill/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Python](https://img.shields.io/pypi/pyversions/metaflow-windmill)](https://pypi.org/project/metaflow-windmill/)
 
-Windmill is an open-source workflow orchestrator that runs Python scripts as DAGs. This
-extension lets you deploy and trigger Metaflow flows as Windmill workflows.
+Run any Metaflow flow on Windmill without rewriting your pipeline.
 
-## Installation
+## The problem
+
+Windmill is a powerful open-source orchestrator, but its native scripting model has no concept of Metaflow steps, data artifacts, or retry semantics. You either maintain two separate codebases — one for Metaflow development and one for Windmill production — or you lose Metaflow's versioning, lineage, and `@retry` guarantees entirely. There is no off-the-shelf bridge that compiles a Metaflow flow into a Windmill workflow while preserving all of its runtime behavior.
+
+## Quick start
+
+```bash
+pip install metaflow-windmill
+python flow.py windmill create --windmill-host http://localhost:8000 --windmill-token $TOKEN
+python flow.py windmill trigger --windmill-host http://localhost:8000 --windmill-token $TOKEN
+# Deploying HelloFlow...
+# Flow deployed successfully to Windmill.
+# Job started: http://localhost:8000/run/01927f3a-...?workspace=admins
+```
+
+## Install
 
 ```bash
 pip install metaflow-windmill
 ```
 
-## Quick Start
-
-Start Windmill locally:
+From source:
 
 ```bash
-docker compose up -d  # use the docker-compose.yml from this repo's devtools/
+git clone https://github.com/npow/metaflow-windmill
+cd metaflow-windmill
+pip install -e .
 ```
 
-Get your API token from the Windmill UI at http://localhost:8000.
+## Usage
 
-Deploy and run your flow:
+**Deploy and trigger in one step:**
 
 ```bash
-# Compile and deploy
-python flow.py windmill create \
-  --windmill-host http://localhost:8000 \
-  --windmill-token <token> \
-  --windmill-workspace admins
-
-# Trigger a run
-python flow.py windmill trigger \
-  --windmill-host http://localhost:8000 \
-  --windmill-token <token> \
-  --windmill-workspace admins
-
-# Or compile, deploy, and trigger in one step
 python flow.py windmill run \
   --windmill-host http://localhost:8000 \
-  --windmill-token <token>
+  --windmill-token $TOKEN \
+  --windmill-workspace admins
+# Compiling HelloFlow...
+# Flow deployed successfully to Windmill.
+# Triggering execution...
+# Job started: http://localhost:8000/run/01927f3a-...?workspace=admins
+# Job is running...
+# Job 01927f3a-... completed successfully.
 ```
 
-## Programmatic API
+**Deploy once, trigger many times with parameters:**
+
+```bash
+python flow.py windmill create --windmill-token $TOKEN
+python flow.py windmill trigger --windmill-token $TOKEN \
+  --run-param message=hello --run-param iterations=5
+```
+
+**Programmatic API:**
 
 ```python
 from metaflow import Deployer
@@ -51,49 +70,47 @@ with Deployer("flow.py") as d:
     df = d.windmill().create(
         windmill_host="http://localhost:8000",
         windmill_token="my-token",
-        windmill_workspace="admins",
     )
-    triggered = df.trigger()
-    print(triggered.run.successful)
+    run = df.trigger(message="hello")
+    print(run.status)          # RUNNING / SUCCEEDED / FAILED
+    print(run.windmill_ui)     # http://localhost:8000/run/<job-id>?workspace=admins
+    print(run.run.successful)  # True
 ```
+
+## How it works
+
+Each Metaflow step becomes a Windmill flow module that runs a bash script. The bash script calls `python flow.py step <step_name>` with `--run-id`, `--task-id`, and `--retry-count` derived from Windmill's native `WM_FLOW_RETRY_COUNT` environment variable. Branch/join steps compile to Windmill `branchall` modules; foreach steps compile to `forloopflow` modules with a configurable `max_workers` concurrency limit. The Metaflow run ID is pre-computed before triggering and threaded through every step so Metaflow's local datastore and the Windmill job ID stay in sync.
+
+Supported graph patterns: linear, branch/join, foreach (including nested foreach), `@condition` splits. `@parallel` and `@batch` are not supported.
 
 ## Configuration
 
-| CLI Option | Env Var | Default | Description |
+| CLI option | Environment variable | Default | Description |
 |---|---|---|---|
-| `--windmill-host` | `WINDMILL_HOST` | `http://localhost:8000` | Windmill server URL |
-| `--windmill-token` | `WINDMILL_TOKEN` | — | API token |
+| `--windmill-host` | `WINDMILL_HOST` | `http://localhost:8000` | Windmill server base URL |
+| `--windmill-token` | `WINDMILL_TOKEN` | — | Windmill API token |
 | `--windmill-workspace` | `WINDMILL_WORKSPACE` | `admins` | Workspace name |
-| `--max-workers` | — | `10` | Max parallel ForEach workers |
-| `--branch` | — | — | @project branch name |
-| `--production` | — | `false` | Deploy to production branch |
+| `--max-workers` | — | `10` | Max concurrent ForEach body tasks |
+| `--branch` | — | — | `@project` branch name |
+| `--production` | — | `false` | Deploy to the production project branch |
+| `--name` | — | derived from class name | Override the Windmill flow path |
 
-## Supported Graph Patterns
+## Development
 
-- Linear flows (sequential steps)
-- Branch/join (parallel branches)
-- ForEach (single level of fan-out)
+```bash
+git clone https://github.com/npow/metaflow-windmill
+cd metaflow-windmill
+pip install -e ".[dev]"
+pytest tests/
+```
 
-Not supported:
-- Nested foreach (foreach inside foreach)
-- Conditional splits (`@condition`)
-- `@batch` (Windmill runs steps as local processes)
+Integration tests require a running Windmill instance:
 
-## How It Works
+```bash
+docker compose up -d
+pytest tests/ -m integration
+```
 
-Each Metaflow step becomes a Windmill flow module that runs a bash script. The bash
-script invokes `python flow.py step <step_name>` with the correct `--run-id`,
-`--task-id`, and `--retry-count` arguments.
+## License
 
-The retry count is derived from Windmill's native `WM_FLOW_RETRY_COUNT` environment
-variable so that Metaflow's `@retry` decorator works correctly.
-
-## Implementation Contract
-
-This extension satisfies all required capabilities:
-
-- **Cap.RUN_PARAMS**: `run_params` is always a list, not a tuple.
-- **Cap.PROJECT_BRANCH**: `--branch` is forwarded to every step subprocess.
-- **Cap.CONFIG_EXPR**: `METAFLOW_FLOW_CONFIG_VALUE` is injected into every step.
-- **Cap.RETRY**: retry count is derived from `WM_FLOW_RETRY_COUNT`.
-- **Cap.FROM_DEPLOYMENT**: handles dotted identifiers (project.branch.FlowName).
+Apache 2.0. See [LICENSE](LICENSE).
