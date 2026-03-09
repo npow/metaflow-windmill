@@ -420,8 +420,26 @@ class WindmillCompiler:
 
     def _build_init_module(self, params: Dict) -> dict:
         """Build the init module that computes mf_run_id and runs metaflow init."""
+        # Windmill passes input_transforms values to bash scripts as positional
+        # arguments ($1, $2, ...), NOT as environment variables.  We assign them
+        # to named shell variables at the top of the script so the rest of the
+        # script can reference them by name.
+        #
+        # The order MUST match the insertion order of keys in input_transforms
+        # (built at the bottom of this method): params first, then
+        # ORIGIN_RUN_ID, then METAFLOW_RUN_ID.
+        arg_idx = 1
+        positional_assigns = []
+        for pname in params:
+            positional_assigns.append('%s="${%d:-}"' % (pname, arg_idx))
+            arg_idx += 1
+        positional_assigns.append('ORIGIN_RUN_ID="${%d:-}"' % arg_idx)
+        arg_idx += 1
+        positional_assigns.append('METAFLOW_RUN_ID="${%d:-}"' % arg_idx)
+        positional_args_block = "\n".join(positional_assigns)
+
         param_collection = "\n".join(
-            'MF_PARAM_%s="${%s:-}"' % (pname.upper(), pname)
+            'MF_PARAM_%s="$%s"' % (pname.upper(), pname)
             for pname in params
         )
 
@@ -461,23 +479,25 @@ set -e
 # Set up Metaflow environment (set PYTHONPATH first so bootstrap check uses it)
 {env_exports}
 
-# Bootstrap: install metaflow using python3's own pip to ensure same Python.
-# Use python3 -m pip (not pip3) to avoid version mismatch between pip3 and python3.
-# PYTHONPATH is set above; if metaflow source is on PYTHONPATH this may already work.
+# Windmill passes input_transforms values as positional arguments to bash
+# scripts.  Assign them to named variables so the rest of the script can
+# reference them by name.
+{positional_args}
+
+# Bootstrap: install metaflow if not already available.
 if ! python3 -c "import metaflow" 2>/dev/null; then
     python3 -m pip install --quiet "metaflow>=2.9" 2>&1 || true
 fi
 
-# Collect parameters from Windmill flow inputs
+# Collect parameters into MF_PARAM_* variables for the init step
 {param_collection}
-ORIGIN_RUN_ID="${{ORIGIN_RUN_ID:-}}"
 
 # Use the pre-computed run ID passed as METAFLOW_RUN_ID flow input.
 # This ensures the pathspec in the deployer matches the actual Metaflow run.
-if [ -n "${{METAFLOW_RUN_ID:-}}" ]; then
+if [ -n "$METAFLOW_RUN_ID" ]; then
   RUN_ID="$METAFLOW_RUN_ID"
 else
-  # Fallback: derive from timestamp (should not normally reach here)
+  # Fallback: derive from timestamp (manual trigger without deployer)
   RUN_ID="windmill-$(date +%s%N | md5sum | head -c 16)"
 fi
 export RUN_ID
@@ -495,6 +515,7 @@ fi
 echo "Initialized Metaflow run: $RUN_ID"
 '''.format(
             env_exports=env_exports,
+            positional_args=positional_args_block,
             param_collection=param_collection,
             init_cmd=base_init_cmd,
         )
