@@ -139,12 +139,13 @@ jobs:
         id: windmill_token
         run: |
           for i in $(seq 1 40); do
-            TOKEN=$(curl -s -X POST http://localhost:8000/api/auth/login \
+            # Windmill returns the token in the Set-Cookie header, not JSON body.
+            # Use -c /dev/stdout to capture cookies, then extract the token value.
+            TOKEN_VALUE=$(curl -s -c /dev/stdout -X POST http://localhost:8000/api/auth/login \
               -H 'Content-Type: application/json' \
-              -d '{"username":"admin@windmill.dev","password":"changeme"}' \
-              2>/dev/null)
-            if echo "$TOKEN" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['token'])" 2>/dev/null; then
-              TOKEN_VALUE=$(echo "$TOKEN" | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+              -d '{"email":"admin@windmill.dev","password":"changeme"}' \
+              2>/dev/null | awk '/\ttoken\t/{print $NF}' | head -1)
+            if [ -n "$TOKEN_VALUE" ]; then
               echo "token=$TOKEN_VALUE" >> $GITHUB_OUTPUT
               echo "Windmill auth ready after $i attempt(s)"
               break
