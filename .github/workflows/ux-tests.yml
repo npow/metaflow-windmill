@@ -128,7 +128,7 @@ jobs:
           # docker exec runs relative to the container's CWD, not the host CWD.
           MF_SRC="${{ github.workspace }}/metaflow-src"
           for i in $(seq 1 30); do
-            if docker exec windmill_worker pip3 install -q -e "$MF_SRC" 2>&1; then
+            if docker exec windmill_worker python3 -m pip install -q -e "$MF_SRC" 2>&1; then
               echo "metaflow installed in worker container from $MF_SRC"
               break
             fi

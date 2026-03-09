@@ -469,13 +469,15 @@ class WindmillCompiler:
 #!/bin/bash
 set -e
 
-# Bootstrap: install metaflow if not available in this worker's Python environment
-if ! python3 -c "import metaflow" 2>/dev/null; then
-    pip3 install --quiet "metaflow>=2.9" 2>/dev/null || pip install --quiet "metaflow>=2.9" 2>/dev/null
-fi
-
-# Set up Metaflow environment
+# Set up Metaflow environment (set PYTHONPATH first so bootstrap check uses it)
 {env_exports}
+
+# Bootstrap: install metaflow using python3's own pip to ensure same Python.
+# Use python3 -m pip (not pip3) to avoid version mismatch between pip3 and python3.
+# PYTHONPATH is set above; if metaflow source is on PYTHONPATH this may already work.
+if ! python3 -c "import metaflow" 2>/dev/null; then
+    python3 -m pip install --quiet "metaflow>=2.9" 2>&1 || true
+fi
 
 # Collect parameters from Windmill flow inputs
 {param_collection}
@@ -563,13 +565,15 @@ echo "Initialized Metaflow run: $RUN_ID"
 #!/bin/bash
 set -e
 
-# Bootstrap: install metaflow if not available in this worker's Python environment
-if ! python3 -c "import metaflow" 2>/dev/null; then
-    pip3 install --quiet "metaflow>=2.9" 2>/dev/null || pip install --quiet "metaflow>=2.9" 2>/dev/null
-fi
-
-# Set up Metaflow environment
+# Set up Metaflow environment (set PYTHONPATH first so bootstrap check uses it)
 {env_exports}
+
+# Bootstrap: install metaflow using python3's own pip to ensure same Python.
+# python3 -m pip (not pip3) avoids version mismatch. PYTHONPATH set above may
+# already make metaflow importable from source without needing to install.
+if ! python3 -c "import metaflow" 2>/dev/null; then
+    python3 -m pip install --quiet "metaflow>=2.9" 2>&1 || true
+fi
 
 # Restore run ID written by the metaflow_init module (same_worker=True shares /tmp)
 RUN_ID=$(cat /tmp/mf_windmill_run_id.txt 2>/dev/null || echo "")
@@ -700,9 +704,10 @@ INPUT_PATHS={input_paths_expr}
 #!/bin/bash
 set -e
 
-# Bootstrap: install metaflow if not available in this worker's Python environment
+# Bootstrap: install metaflow using python3's own pip to ensure same Python
+# Use python3 -m pip (not pip3) to avoid version mismatch between pip3 and python3
 if ! python3 -c "import metaflow" 2>/dev/null; then
-    pip3 install --quiet "metaflow>=2.9" 2>/dev/null || pip install --quiet "metaflow>=2.9" 2>/dev/null
+    python3 -m pip install --quiet "metaflow>=2.9" 2>&1 || true
 fi
 
 {env_exports}
@@ -837,13 +842,15 @@ INPUT_PATHS={body_input_paths_expr}
 #!/bin/bash
 set -e
 
-# Bootstrap: install metaflow if not available in this worker's Python environment
-if ! python3 -c "import metaflow" 2>/dev/null; then
-    pip3 install --quiet "metaflow>=2.9" 2>/dev/null || pip install --quiet "metaflow>=2.9" 2>/dev/null
-fi
-
-# Set up Metaflow environment
+# Set up Metaflow environment (set PYTHONPATH first so bootstrap check uses it)
 {env_exports}
+
+# Bootstrap: install metaflow using python3's own pip to ensure same Python.
+# python3 -m pip (not pip3) avoids version mismatch. PYTHONPATH set above may
+# already make metaflow importable from source without needing to install.
+if ! python3 -c "import metaflow" 2>/dev/null; then
+    python3 -m pip install --quiet "metaflow>=2.9" 2>&1 || true
+fi
 
 # Restore run ID written by the metaflow_init module (same_worker=True shares /tmp)
 RUN_ID=$(cat /tmp/mf_windmill_run_id.txt 2>/dev/null || echo "")
