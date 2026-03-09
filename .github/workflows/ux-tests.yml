@@ -250,8 +250,8 @@ jobs:
           docker logs --tail=100 windmill_worker 2>&1 || echo "(no worker logs)"
           echo "=== Windmill server logs ==="
           docker logs --tail=50 windmill_server 2>&1 || echo "(no server logs)"
-          echo "=== Metaflow sysroot contents ==="
-          ls -la /tmp/mf-windmill-test/ 2>/dev/null || echo "(sysroot empty)"
+          echo "=== Metaflow sysroot tree ==="
+          sudo find /tmp/mf-windmill-test -ls 2>/dev/null || echo "(sysroot empty)"
 
       - name: Upload coverage
         if: always()

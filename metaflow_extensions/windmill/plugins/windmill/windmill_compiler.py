@@ -448,7 +448,7 @@ class WindmillCompiler:
         # --task-id is required for 'init' in OSS Metaflow.
         # Parameters are passed as METAFLOW_PARAMETER_* env vars to the start step,
         # not via --run-param (which is a NFLX-only init option).
-        base_init_cmd += " init --run-id $RUN_ID --task-id 1"
+        base_init_cmd += " init --run-id $RUN_ID --task-id windmill-params"
         for tag in self.tags:
             base_init_cmd += " --tag " + tag
 
@@ -539,7 +539,7 @@ echo "Initialized Metaflow run: $RUN_ID"
         #   join steps:       comma-separated list of $RUN_ID/{parent}/1 for each parent
         in_funcs = list(node.in_funcs)
         if node.name == "start":
-            input_paths_expr = '"$RUN_ID/_parameters/1"'
+            input_paths_expr = '"$RUN_ID/_parameters/windmill-params"'
         elif len(in_funcs) == 1:
             parent = in_funcs[0]
             input_paths_expr = '"$RUN_ID/%s/1"' % parent
@@ -799,7 +799,7 @@ INPUT_PATHS={body_input_paths_expr}
 
         in_funcs = list(node.in_funcs)
         if node.name == "start":
-            input_paths_expr = '"$RUN_ID/_parameters/1"'
+            input_paths_expr = '"$RUN_ID/_parameters/windmill-params"'
         elif len(in_funcs) == 1:
             parent = in_funcs[0]
             input_paths_expr = '"$RUN_ID/%s/1"' % parent
