@@ -244,7 +244,16 @@ jobs:
               --only-backend windmill \
               --timeout=300 \
               -v \
-              --tb=long
+              --tb=long \
+              --junitxml=junit-deployer-${{ matrix.test }}.xml
+
+      - name: Upload JUnit XML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-deployer-${{ matrix.test }}
+          path: junit-deployer-${{ matrix.test }}.xml
+          if-no-files-found: ignore
 
       - name: Dump Windmill worker logs (on failure)
         if: failure()
@@ -282,3 +291,25 @@ jobs:
           path: coverage.xml
           if-no-files-found: ignore
           include-hidden-files: true
+
+  test-report:
+    if: always()
+    needs: [unit-tests, deployer-tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Download all JUnit XML artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-*
+          path: junit-artifacts/
+
+      - name: Publish combined test report
+        uses: dorny/test-reporter@v1
+        with:
+          name: "Test Results — All Backends"
+          path: "junit-artifacts/**/*.xml"
+          reporter: java-junit
+          fail-on-error: false
