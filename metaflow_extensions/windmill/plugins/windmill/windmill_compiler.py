@@ -202,7 +202,8 @@ class WindmillCompiler:
         flow_value = {
             "modules": modules,
             # same_worker=True forces all modules to run on the SAME worker process.
-            # This allows modules to share /tmp files (e.g. for passing the run ID).
+            # Run ID is passed via Windmill's native results mechanism (input_transforms),
+            # with /tmp as a fallback for backward compatibility.
             "same_worker": True,
         }
         return {
@@ -462,12 +463,20 @@ if ! python3 -c "import metaflow" 2>/dev/null; then
 fi'''
 
     def _restore_run_id_snippet(self) -> str:
-        """Return a bash snippet that reads the run ID from the shared /tmp file."""
+        """Return a bash snippet that reads the run ID from Windmill input_transforms.
+
+        The RUN_ID is passed as $1 via input_transforms from ``results.metaflow_init``.
+        Falls back to reading from /tmp for backward compatibility with same_worker mode.
+        """
         return '''\
-# Restore run ID written by the init module (same_worker=True shares /tmp)
-RUN_ID=$(cat /tmp/mf_windmill_run_id.txt 2>/dev/null || echo "")
+# Read RUN_ID from Windmill input_transforms (results.metaflow_init)
+RUN_ID="${1:-}"
 if [ -z "$RUN_ID" ]; then
-  echo "ERROR: RUN_ID not set. Init step may have failed or same_worker is not enabled."
+  # Fallback: read from /tmp (same_worker mode)
+  RUN_ID=$(cat /tmp/mf_windmill_run_id.txt 2>/dev/null || echo "")
+fi
+if [ -z "$RUN_ID" ]; then
+  echo "ERROR: RUN_ID not set. Init step may have failed."
   exit 1
 fi'''
 
@@ -555,6 +564,10 @@ else
 fi
 
 echo "Initialized Metaflow run: $RUN_ID"
+
+# Output ONLY the run ID as the last line of stdout.
+# Windmill captures this as results.metaflow_init for downstream modules.
+echo "$RUN_ID"
 '''.format(
             env_exports=env_exports,
             positional_args=positional_args_block,
@@ -624,7 +637,12 @@ INPUT_PATHS={input_paths_expr}
                 "type": "rawscript",
                 "content": script,
                 "language": "bash",
-                "input_transforms": {},
+                "input_transforms": {
+                    "RUN_ID": {
+                        "type": "javascript",
+                        "expr": "results.metaflow_init",
+                    },
+                },
             },
         }
         return self._apply_retry_and_timeout(module, node)
@@ -734,7 +752,12 @@ INPUT_PATHS={body_input_paths_expr}
                 "type": "rawscript",
                 "content": body_script,
                 "language": "bash",
-                "input_transforms": {},
+                "input_transforms": {
+                    "RUN_ID": {
+                        "type": "javascript",
+                        "expr": "results.metaflow_init",
+                    },
+                },
             },
         }
 
@@ -821,6 +844,9 @@ INPUT_PATHS={input_paths_expr}
 
 {step_cmd} --run-id "$RUN_ID" --task-id windmill-1 --retry-count "$RETRY_COUNT" --input-paths "$INPUT_PATHS"
 
+# Export RUN_ID so the Python heredoc can access it via os.environ
+export RUN_ID
+
 # Read the chosen branch from the Metaflow datastore and output as JSON
 # so that the branchone module can pick the correct branch at runtime.
 python3 << 'PYEOF'
@@ -832,7 +858,7 @@ from metaflow.datastore import FlowDataStore
 from metaflow.plugins import DATASTORES
 
 root = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", "{sysroot}")
-run_id = open("/tmp/mf_windmill_run_id.txt").read().strip()
+run_id = os.environ.get("RUN_ID", "") or open("/tmp/mf_windmill_run_id.txt").read().strip()
 impl = next(d for d in DATASTORES if d.TYPE == "local")
 fds = FlowDataStore(
     "{flow_name}", None,
@@ -864,7 +890,12 @@ PYEOF
                 "type": "rawscript",
                 "content": script,
                 "language": "bash",
-                "input_transforms": {},
+                "input_transforms": {
+                    "RUN_ID": {
+                        "type": "javascript",
+                        "expr": "results.metaflow_init",
+                    },
+                },
             },
         }
         return self._apply_retry_and_timeout(module, node)
