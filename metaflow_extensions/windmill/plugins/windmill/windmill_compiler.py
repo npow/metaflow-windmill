@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -122,7 +123,8 @@ class WindmillCompiler:
             }
             if config_env:
                 return json.dumps(config_env)
-        except Exception:
+        except (AttributeError, KeyError, ImportError, TypeError):
+            # Best-effort: older metaflow versions may not have FlowStateItems.CONFIGS
             pass
         return None
 
@@ -132,7 +134,12 @@ class WindmillCompiler:
             from metaflow.decorators import flow_decorators
             for deco in flow_decorators(self.flow):
                 if deco.name == "project":
-                    project_name = deco.attributes.get("name", "")
+                    project_name = deco.attributes.get("name", "") or ""
+                    if not project_name:
+                        raise ValueError(
+                            "@project decorator has no 'name' attribute; "
+                            "cannot derive Windmill flow path."
+                        )
                     if self.production:
                         branch = "prod"
                     elif self.branch:
@@ -145,7 +152,8 @@ class WindmillCompiler:
                         "branch": branch,
                         "flow_name": flow_name,
                     }
-        except Exception:
+        except (ImportError, AttributeError):
+            # metaflow.decorators unavailable — treat as no @project
             pass
         return None
 
@@ -181,7 +189,7 @@ class WindmillCompiler:
             from metaflow.plugins.timeout_decorator import get_run_time_limit_for_task
             limit = get_run_time_limit_for_task(node.decorators)
             return limit
-        except Exception:
+        except (ImportError, AttributeError):
             pass
         return None
 
@@ -383,7 +391,7 @@ class WindmillCompiler:
     def _base_cmd_parts(self) -> list:
         """Return the shared top-level CLI flags (before any subcommand)."""
         parts = [
-            "python3", self.flow_file,
+            "python3", shlex.quote(self.flow_file),
             "--no-pylint",
             "--quiet",
             "--metadata", self._metadata_type,
@@ -396,17 +404,17 @@ class WindmillCompiler:
         if self._datastore_root:
             # The CLI --datastore-root expects the full path including .metaflow.
             # _datastore_root is the SYSROOT (parent of .metaflow).
-            parts += ["--datastore-root", self._datastore_root + "/.metaflow"]
+            parts += ["--datastore-root", shlex.quote(self._datastore_root + "/.metaflow")]
 
         # REQUIRED (Cap.PROJECT_BRANCH): --branch MUST be forwarded
         if self.branch:
-            parts += ["--branch", self.branch]
+            parts += ["--branch", shlex.quote(self.branch)]
 
         if self.namespace:
-            parts += ["--namespace", self.namespace]
+            parts += ["--namespace", shlex.quote(self.namespace)]
 
         for deco in self.with_decorators:
-            parts += ["--with", deco]
+            parts += ["--with", shlex.quote(deco)]
 
         return parts
 
@@ -417,7 +425,7 @@ class WindmillCompiler:
         # in OSS Metaflow.
         parts += ["step", step_name]
         for tag in self.tags:
-            parts += ["--tag", tag]
+            parts += ["--tag", shlex.quote(tag)]
         return " ".join(parts)
 
     def _input_paths_expr(self, node) -> str:
@@ -830,6 +838,8 @@ INPUT_PATHS={body_input_paths_expr}
         # _transition is stored as a pickled Python tuple ([step_name], None).
         # We use a heredoc for readability instead of a semicolon-separated one-liner.
         sysroot = self._datastore_root or ""
+        # Escape sysroot for safe embedding in a Python string literal inside the heredoc.
+        safe_sysroot = json.dumps(sysroot)[1:-1]  # json-escape, strip surrounding quotes
 
         script = '''\
 #!/bin/bash
@@ -878,7 +888,7 @@ PYEOF
             restore_run_id=self._restore_run_id_snippet(),
             step_cmd=step_base_cmd,
             input_paths_expr=input_paths_expr,
-            sysroot=sysroot,
+            sysroot=safe_sysroot,
             flow_name=self.name,
             step_name=node.name,
         )
@@ -962,22 +972,24 @@ PYEOF
 
     def _find_foreach_join(self, foreach_step_name: str) -> Optional[str]:
         """Return the join step name for the given foreach step."""
+        # Primary: split_parents is authoritative for foreach
         for node in self.graph:
             if node.type == "join":
                 parents = list(getattr(node, "split_parents", []))
                 if parents and parents[-1] == foreach_step_name:
                     return node.name
-        # Fallback: body's out_func
-        body_name = self.graph[foreach_step_name].out_funcs[0]
-        return self.graph[body_name].out_funcs[0]
+        # Fallback: DFS from body step tracking nesting depth.
+        foreach_node = self.graph[foreach_step_name]
+        if not foreach_node.out_funcs:
+            return None
+        return self._dfs_find_join(foreach_node.out_funcs[0])
 
     def _find_join_step(self, split_step_name: str) -> Optional[str]:
-        """Return the join step for a given split step.
+        """Return the join step for a given split or split-switch step.
 
         For regular split nodes, the join node's split_parents[-1] equals the
-        split step name.  For split-switch nodes the graph traversal does not
-        push the switch onto split_parents, so we fall back to tracing through
-        the branch steps to find the convergent join.
+        split step name.  For split-switch nodes the graph does not populate
+        split_parents, so we DFS one branch with depth tracking.
         """
         split_node = self.graph[split_step_name]
 
@@ -989,20 +1001,37 @@ PYEOF
                     if parents and parents[-1] == split_step_name:
                         return node.name
 
-        # For split-switch (and as a fallback for split), follow branch out_funcs
-        # until we hit a join node — that's the convergence point.
-        for branch_name in split_node.out_funcs:
-            branch_node = self.graph[branch_name]
-            # Walk forward until we find the join
-            current = branch_node
-            while current is not None:
-                for next_name in current.out_funcs:
-                    next_node = self.graph[next_name]
-                    if next_node.type == "join":
-                        return next_name
-                    current = next_node
-                    break  # follow the first out_func
-                else:
-                    break
+        # Fallback for split-switch (and any split not covered above):
+        # DFS one branch, counting nested splits so we return the *outer* join.
+        if not split_node.out_funcs:
+            return None
+        return self._dfs_find_join(split_node.out_funcs[0])
 
+    def _dfs_find_join(self, start_step: str) -> Optional[str]:
+        """DFS from start_step to find the first join at nesting depth 0.
+
+        Tracks depth: each nested split/foreach increments depth; each join
+        decrements depth.  The first join encountered at depth 0 is the one
+        that closes the enclosing split.
+        """
+        stack = [(start_step, 0)]  # (step_name, nesting_depth)
+        seen = set()
+        while stack:
+            step_name, depth = stack.pop()
+            if step_name in seen:
+                continue
+            seen.add(step_name)
+            node = self.graph[step_name]
+            if node.type == "join":
+                if depth == 0:
+                    return step_name
+                # Inner join — pop one level of nesting and continue through it
+                for next_name in node.out_funcs:
+                    stack.append((next_name, depth - 1))
+            elif node.type in ("split", "split-switch", "foreach"):
+                for next_name in node.out_funcs:
+                    stack.append((next_name, depth + 1))
+            else:
+                for next_name in node.out_funcs:
+                    stack.append((next_name, depth))
         return None

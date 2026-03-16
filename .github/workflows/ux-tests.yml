@@ -49,6 +49,8 @@ jobs:
           - test: test_hello_world
           - test: test_hello_project
           - test: test_from_deployment
+          - test: test_fail_flow_reports_failed_status
+          - test: test_split_in_branch_deployer
 
     env:
       METAFLOW_DEFAULT_METADATA: local

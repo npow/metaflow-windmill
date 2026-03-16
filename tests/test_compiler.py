@@ -325,6 +325,387 @@ def test_run_params_is_list():
     assert len(run_params) == 2
 
 
+def test_shell_quoting_flow_file_with_spaces():
+    """Shell injection: flow_file path with spaces must be quoted in generated scripts."""
+    from metaflow import FlowSpec, step
+    from metaflow_extensions.windmill.plugins.windmill.windmill_compiler import (
+        WindmillCompiler,
+    )
+    from metaflow.graph import FlowGraph
+
+    class SimpleFlow(FlowSpec):
+        @step
+        def start(self):
+            self.next(self.end)
+
+        @step
+        def end(self):
+            pass
+
+    class MockMeta:
+        TYPE = "local"
+
+    class MockDatastore:
+        TYPE = "local"
+        datastore_root = "/tmp/mf_test"
+
+    class MockEnv:
+        TYPE = "local"
+
+    class MockLogger:
+        TYPE = "nullSidecarLogger"
+
+    class MockMonitor:
+        TYPE = "nullSidecarMonitor"
+
+    compiler = WindmillCompiler(
+        name="SimpleFlow",
+        graph=FlowGraph(SimpleFlow),
+        flow=SimpleFlow,
+        flow_file="/path with spaces/flow.py",
+        metadata=MockMeta(),
+        flow_datastore=MockDatastore(),
+        environment=MockEnv(),
+        event_logger=MockLogger(),
+        monitor=MockMonitor(),
+    )
+    result = compiler.compile()
+    modules = result["value"]["modules"]
+    start_module = next(m for m in modules if m["id"] == "start")
+    script = start_module["value"]["content"]
+    # Unquoted path would appear as two tokens; quoted appears as one shlex token
+    assert "'/path with spaces/flow.py'" in script, (
+        "flow_file path with spaces must be shell-quoted in step scripts"
+    )
+
+
+def test_shell_quoting_branch_with_semicolon():
+    """Shell injection: branch name with semicolon must not execute as shell command."""
+    from metaflow import FlowSpec, step
+
+    class SimpleFlow(FlowSpec):
+        @step
+        def start(self):
+            self.next(self.end)
+
+        @step
+        def end(self):
+            pass
+
+    compiler = _make_compiler(SimpleFlow, branch="mybranch;echo PWNED")
+    result = compiler.compile()
+    modules = result["value"]["modules"]
+    start_module = next(m for m in modules if m["id"] == "start")
+    script = start_module["value"]["content"]
+    assert "echo PWNED" not in script or "'mybranch;echo PWNED'" in script, (
+        "branch name with semicolon must be shell-quoted, not allow command injection"
+    )
+
+
+def test_shell_quoting_tag_with_special_chars():
+    """Shell injection: tags with special chars must be shell-quoted."""
+    from metaflow import FlowSpec, step
+
+    class SimpleFlow(FlowSpec):
+        @step
+        def start(self):
+            self.next(self.end)
+
+        @step
+        def end(self):
+            pass
+
+    compiler = _make_compiler(SimpleFlow, tags=["valid-tag", "bad$(rm -rf /)tag"])
+    result = compiler.compile()
+    modules = result["value"]["modules"]
+    start_module = next(m for m in modules if m["id"] == "start")
+    script = start_module["value"]["content"]
+    # The $(...) must not appear unquoted
+    assert "'bad$(rm -rf /)tag'" in script or "bad\\$(rm -rf /)tag" in script, (
+        "tag with $(...) must be shell-quoted"
+    )
+
+
+def test_join_detection_nested_split_in_branch():
+    """Correctness: split with a nested split inside a branch must find the outer join."""
+    from metaflow import FlowSpec, step
+
+    class NestedSplitInBranchFlow(FlowSpec):
+        @step
+        def start(self):
+            self.next(self.branch_a, self.branch_b)
+
+        @step
+        def branch_a(self):
+            # This branch has a nested split inside it
+            self.next(self.inner_x, self.inner_y)
+
+        @step
+        def inner_x(self):
+            self.next(self.inner_join)
+
+        @step
+        def inner_y(self):
+            self.next(self.inner_join)
+
+        @step
+        def inner_join(self, inputs):
+            self.next(self.outer_join)
+
+        @step
+        def branch_b(self):
+            self.next(self.outer_join)
+
+        @step
+        def outer_join(self, inputs):
+            self.next(self.end)
+
+        @step
+        def end(self):
+            pass
+
+    compiler = _make_compiler(NestedSplitInBranchFlow)
+    result = compiler.compile()
+    modules = result["value"]["modules"]
+    module_ids = [m["id"] for m in modules]
+
+    # outer_join must be present at the top level (not inside a branch module)
+    assert "outer_join" in module_ids, "outer_join must appear at top level"
+    assert "end" in module_ids, "end must appear after outer_join"
+
+    # The branchall must route to inner_join inside a branch, not at top level
+    branchall = next(
+        (m for m in modules if m["value"].get("type") == "branchall"), None
+    )
+    assert branchall is not None
+    top_level_branch_ids = {m["id"] for m in modules}
+    assert "inner_join" not in top_level_branch_ids, (
+        "inner_join should be INSIDE a branch, not at top level"
+    )
+
+
+def _make_mock_flow_with_params(params_kwargs_list):
+    """Build a mock flow object whose _get_parameters() yields mock Parameters.
+
+    Each entry in params_kwargs_list is a dict with 'name' and optional 'kwargs'
+    (the already-resolved kwargs dict, as would exist after param.init() runs).
+    """
+    from unittest.mock import MagicMock
+
+    mock_params = []
+    for spec in params_kwargs_list:
+        p = MagicMock()
+        p.name = spec["name"]
+        p.kwargs = spec.get("kwargs", {})
+        mock_params.append(p)
+
+    mock_flow = MagicMock()
+    mock_flow._get_parameters.return_value = [("_", p) for p in mock_params]
+    mock_flow._flow_decorators = {}
+    return mock_flow
+
+
+def test_validate_workflow_requires_defaults():
+    """_validate_workflow raises when a parameter has no default (kwargs empty)."""
+    from metaflow.exception import MetaflowException
+    from metaflow_extensions.windmill.plugins.windmill.windmill_cli import (
+        _validate_workflow,
+    )
+    from metaflow.graph import FlowGraph
+    from metaflow import FlowSpec, step
+
+    class NoDefaultFlow(FlowSpec):
+        @step
+        def start(self):
+            self.next(self.end)
+
+        @step
+        def end(self):
+            pass
+
+    graph = FlowGraph(NoDefaultFlow)
+    # Mock a flow with a parameter that has no 'default' in kwargs (uninitialized)
+    mock_flow = _make_mock_flow_with_params([{"name": "name", "kwargs": {}}])
+    with pytest.raises(MetaflowException, match="default"):
+        _validate_workflow(mock_flow, graph)
+
+
+def test_validate_workflow_rejects_duplicate_params():
+    """_validate_workflow raises on case-insensitive duplicate parameter names."""
+    from metaflow.exception import MetaflowException
+    from metaflow_extensions.windmill.plugins.windmill.windmill_cli import (
+        _validate_workflow,
+    )
+    from metaflow.graph import FlowGraph
+    from metaflow import FlowSpec, step
+
+    class SimpleFlow(FlowSpec):
+        @step
+        def start(self):
+            self.next(self.end)
+
+        @step
+        def end(self):
+            pass
+
+    graph = FlowGraph(SimpleFlow)
+    mock_flow = _make_mock_flow_with_params([
+        {"name": "my_param", "kwargs": {"default": "a"}},
+        {"name": "MY_PARAM", "kwargs": {"default": "b"}},  # same name, different case
+    ])
+    with pytest.raises(MetaflowException, match="twice"):
+        _validate_workflow(mock_flow, graph)
+
+
+def test_validate_workflow_passes_valid_flow():
+    """_validate_workflow does not raise for a flow with a properly initialized param."""
+    from metaflow_extensions.windmill.plugins.windmill.windmill_cli import (
+        _validate_workflow,
+    )
+    from metaflow.graph import FlowGraph
+    from metaflow import FlowSpec, step
+
+    class SimpleFlow(FlowSpec):
+        @step
+        def start(self):
+            self.next(self.end)
+
+        @step
+        def end(self):
+            pass
+
+    graph = FlowGraph(SimpleFlow)
+    # A param with 'default' in kwargs (post-init state)
+    mock_flow = _make_mock_flow_with_params([
+        {"name": "msg", "kwargs": {"default": "hello"}},
+    ])
+    _validate_workflow(mock_flow, graph)  # must not raise
+
+
+def test_token_not_in_deployed_flow_id():
+    """Security: windmill_token must not appear in WindmillDeployedFlow.id."""
+    from metaflow_extensions.windmill.plugins.windmill.windmill_deployer_objects import (
+        WindmillDeployedFlow,
+    )
+
+    recovered = WindmillDeployedFlow.from_deployment(
+        "HelloFlow",
+        # Simulate token being present in env at from_deployment time
+    )
+    import os
+    os.environ["WINDMILL_TOKEN"] = "super-secret-token-12345"
+    try:
+        recovered2 = WindmillDeployedFlow.from_deployment("HelloFlow")
+        assert "super-secret-token-12345" not in recovered2.id, (
+            "windmill_token must NOT appear in the serialized .id property"
+        )
+    finally:
+        os.environ.pop("WINDMILL_TOKEN", None)
+
+
+def test_wait_for_job_respects_timeout():
+    """_wait_for_job must raise WindmillException after max_wait seconds."""
+    import time
+    from unittest.mock import MagicMock, patch
+    from metaflow_extensions.windmill.plugins.windmill.windmill_cli import (
+        _wait_for_job,
+        WindmillClient,
+    )
+    from metaflow_extensions.windmill.plugins.windmill.exception import WindmillException
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"type": "QueuedJob"}  # never completes
+
+    mock_session = MagicMock()
+    mock_session.get.return_value = mock_resp
+
+    client = WindmillClient(
+        host="http://localhost:8000",
+        workspace="admins",
+        session=mock_session,
+    )
+    obj = MagicMock()
+
+    with patch("time.sleep"):  # skip actual sleeping
+        with pytest.raises(WindmillException, match="did not complete"):
+            _wait_for_job(client, "fake-job-id", obj, poll_interval=0, max_wait=1)
+
+
+def test_triggered_run_status_with_mock_filesystem(tmp_path):
+    """WindmillTriggeredRun._check_sysroot_completion returns SUCCEEDED with marker file."""
+    import json
+    from unittest.mock import MagicMock
+    from metaflow_extensions.windmill.plugins.windmill.windmill_deployer_objects import (
+        WindmillTriggeredRun,
+    )
+
+    # Build the expected sysroot directory structure for a completed run
+    sysroot = str(tmp_path)
+    run_id = "windmill-abc123"
+    flow_name = "TestFlow"
+    end_task = tmp_path / ".metaflow" / flow_name / run_id / "end" / "windmill-1"
+    end_task.mkdir(parents=True)
+    (end_task / "0.DONE.lock").touch()
+
+    content = json.dumps({
+        "pathspec": "%s/%s" % (flow_name, run_id),
+        "name": "TestFlow",
+        "job_id": "wm-job-1",
+        "job_url": "http://localhost:8000/run/wm-job-1?workspace=admins",
+        "metadata": "{}",
+    })
+
+    mock_deployer = MagicMock()
+    mock_deployer.env_vars = {
+        "METAFLOW_DATASTORE_SYSROOT_LOCAL": sysroot,
+        "METAFLOW_DEFAULT_METADATA": "local",
+    }
+
+    run_obj = WindmillTriggeredRun(deployer=mock_deployer, content=content)
+    # Set the env var that _check_sysroot_completion reads from os.environ
+    os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
+    try:
+        # Call the sysroot probe directly (not .status, which also calls metaflow.Run)
+        result = run_obj._check_sysroot_completion()
+        assert result == "SUCCEEDED", "Expected SUCCEEDED when 0.DONE.lock is present"
+    finally:
+        os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
+
+
+def test_triggered_run_status_pending_when_run_dir_missing(tmp_path):
+    """WindmillTriggeredRun._check_sysroot_completion returns None when run_dir absent."""
+    import json
+    from unittest.mock import MagicMock
+    from metaflow_extensions.windmill.plugins.windmill.windmill_deployer_objects import (
+        WindmillTriggeredRun,
+    )
+    import os
+
+    sysroot = str(tmp_path)
+    content = json.dumps({
+        "pathspec": "TestFlow/windmill-doesnotexist",
+        "name": "TestFlow",
+        "job_id": "wm-job-x",
+        "job_url": "http://localhost:8000/run/wm-job-x?workspace=admins",
+        "metadata": "{}",
+    })
+    mock_deployer = MagicMock()
+    mock_deployer.env_vars = {
+        "METAFLOW_DATASTORE_SYSROOT_LOCAL": sysroot,
+        "METAFLOW_DEFAULT_METADATA": "local",
+    }
+    os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
+
+    try:
+        run_obj = WindmillTriggeredRun(deployer=mock_deployer, content=content)
+        result = run_obj._check_sysroot_completion()
+        # run_dir doesn't exist → None (caller maps this to "PENDING")
+        assert result is None, "Expected None when run directory does not exist yet"
+    finally:
+        os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
+
+
 def test_conditional_split_compiles():
     """@condition (split-switch) compiles to a branchone module."""
     from metaflow import FlowSpec, step

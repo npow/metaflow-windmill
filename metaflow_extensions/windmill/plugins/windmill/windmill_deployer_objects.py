@@ -203,13 +203,18 @@ class WindmillDeployedFlow(DeployedFlow):
 
     @property
     def id(self) -> str:
-        """Deployment identifier encoding all info needed for from_deployment."""
+        """Deployment identifier encoding all info needed for from_deployment.
+
+        Credentials (windmill_token) are intentionally excluded — they are
+        read from WINDMILL_TOKEN at trigger time via from_deployment().
+        """
         additional_info = getattr(self.deployer, "additional_info", {}) or {}
+        safe_info = {k: v for k, v in additional_info.items() if k != "windmill_token"}
         return json.dumps({
             "name": self.name,
             "flow_name": self.flow_name,
             "flow_file": getattr(self.deployer, "flow_file", None),
-            **additional_info,
+            **safe_info,
         })
 
     def run(self, **kwargs) -> WindmillTriggeredRun:

@@ -187,7 +187,8 @@ def create(
                     "additional_info": {
                         "flow_path": flow_path,
                         "windmill_host": windmill_host,
-                        "windmill_token": windmill_token,
+                        # windmill_token intentionally omitted — read from
+                        # WINDMILL_TOKEN env var at trigger time.
                         "windmill_workspace": windmill_workspace,
                     },
                 },
@@ -311,6 +312,13 @@ def trigger(
     show_default=True,
     help="Wait for the execution to complete.",
 )
+@click.option(
+    "--max-wait",
+    default=3600,
+    show_default=True,
+    type=int,
+    help="Maximum seconds to wait for job completion (only with --wait).",
+)
 @click.pass_obj
 def run(
     obj,
@@ -324,6 +332,7 @@ def run(
     branch,
     production,
     wait,
+    max_wait,
 ):
     _validate_workflow(obj.flow, obj.graph)
 
@@ -352,7 +361,7 @@ def run(
 
     if wait:
         obj.echo("Waiting for job to complete...")
-        success, final_state = _wait_for_job(client, job_id, obj)
+        success, final_state = _wait_for_job(client, job_id, obj, max_wait=max_wait)
         if success:
             obj.echo("Job *%s* completed successfully." % job_id, bold=True)
         else:
@@ -524,13 +533,23 @@ def _trigger_job(client: WindmillClient, flow_path: str, inputs: dict = None) ->
     )
 
 
-def _wait_for_job(client: WindmillClient, job_id: str, obj, poll_interval: int = 3):
-    """Poll until the job reaches a terminal state. Returns (success, state)."""
+def _wait_for_job(
+    client: WindmillClient,
+    job_id: str,
+    obj,
+    poll_interval: int = 3,
+    max_wait: int = 3600,
+):
+    """Poll until the job reaches a terminal state. Returns (success, state).
+
+    Raises WindmillException if the job does not complete within *max_wait* seconds.
+    """
     url = "%s/api/w/%s/jobs_u/get/%s" % (client.host, client.workspace, job_id)
 
     seen_running = False
+    deadline = time.time() + max_wait
 
-    while True:
+    while time.time() < deadline:
         try:
             resp = client.session.get(url, headers={"Content-Type": None})
             if resp.status_code == 200:
@@ -550,3 +569,7 @@ def _wait_for_job(client: WindmillClient, job_id: str, obj, poll_interval: int =
             obj.echo("Warning: error polling job: %s" % exc)
 
         time.sleep(poll_interval)
+
+    raise WindmillException(
+        "Job %s did not complete within %d seconds." % (job_id, max_wait)
+    )
