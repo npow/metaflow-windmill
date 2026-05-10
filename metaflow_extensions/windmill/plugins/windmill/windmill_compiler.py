@@ -209,10 +209,18 @@ class WindmillCompiler:
         modules = self._build_modules(params)
         flow_value = {
             "modules": modules,
-            # same_worker=True forces all modules to run on the SAME worker process.
-            # Run ID is passed via Windmill's native results mechanism (input_transforms),
-            # with /tmp as a fallback for backward compatibility.
-            "same_worker": True,
+            # Note: we deliberately do NOT set ``same_worker: true``.
+            # Windmill rejects flows that combine ``same_worker: true`` with any
+            # ``parallel: true`` branchall module:
+            #   "Cannot continue on same worker with multiple jobs, parallel
+            #    cannot be used in conjunction with same_worker"
+            # We need parallel branchall for Metaflow split steps, so same_worker
+            # has to stay off. Run ID propagation no longer relies on a shared
+            # /tmp — every step pulls RUN_ID from ``results.metaflow_init`` via
+            # input_transforms (see _build_init_module / _restore_run_id_snippet).
+            # The local Metaflow datastore root is a docker volume shared across
+            # workers, so per-step artifacts persist regardless of which worker
+            # picks up each module.
         }
         return {
             "summary": "Metaflow flow: %s" % self._flow_name,
@@ -474,15 +482,10 @@ fi'''
         """Return a bash snippet that reads the run ID from Windmill input_transforms.
 
         The RUN_ID is passed as $1 via input_transforms from ``results.metaflow_init``.
-        Falls back to reading from /tmp for backward compatibility with same_worker mode.
         """
         return '''\
 # Read RUN_ID from Windmill input_transforms (results.metaflow_init)
 RUN_ID="${1:-}"
-if [ -z "$RUN_ID" ]; then
-  # Fallback: read from /tmp (same_worker mode)
-  RUN_ID=$(cat /tmp/mf_windmill_run_id.txt 2>/dev/null || echo "")
-fi
 if [ -z "$RUN_ID" ]; then
   echo "ERROR: RUN_ID not set. Init step may have failed."
   exit 1
@@ -560,9 +563,6 @@ else
   RUN_ID="windmill-$(date +%s%N | md5sum | head -c 16)"
 fi
 export RUN_ID
-
-# Store run ID for downstream steps to use via /tmp (same_worker=True shares /tmp)
-echo "$RUN_ID" > /tmp/mf_windmill_run_id.txt
 
 # Initialize Metaflow run (creates _parameters artifact)
 if [ -n "$ORIGIN_RUN_ID" ]; then

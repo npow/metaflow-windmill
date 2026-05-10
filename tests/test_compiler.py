@@ -769,3 +769,52 @@ def test_conditional_split_compiles():
 
     # Join step emitted at top level after branchone
     assert "join" in module_ids, "join step should be at top level after branchone"
+
+
+def test_compiled_flow_omits_same_worker():
+    """Regression: compiled flows must not set ``same_worker: true``.
+
+    Windmill server rejects a flow that combines ``same_worker: true`` with any
+    ``parallel: true`` branchall module:
+      "Cannot continue on same worker with multiple jobs, parallel cannot be
+       used in conjunction with same_worker"
+    Run-ID propagation moved off /tmp onto input_transforms (PR #1), so we no
+    longer need same_worker — and keeping it would block any flow with a split.
+    """
+    from metaflow import FlowSpec, step
+
+    class TwoBranchFlow(FlowSpec):
+        @step
+        def start(self):
+            self.next(self.a, self.b)
+
+        @step
+        def a(self):
+            self.next(self.join)
+
+        @step
+        def b(self):
+            self.next(self.join)
+
+        @step
+        def join(self, inputs):
+            self.next(self.end)
+
+        @step
+        def end(self):
+            pass
+
+    compiler = _make_compiler(TwoBranchFlow)
+    flow_value = compiler.compile()["value"]
+    assert "same_worker" not in flow_value, (
+        "Compiled flow must not set same_worker — incompatible with parallel branchall."
+    )
+    # And the branchall actually has parallel: true (sanity)
+    branchall = next(
+        (m for m in flow_value["modules"] if m["value"].get("type") == "branchall"),
+        None,
+    )
+    assert branchall is not None, "Two-branch flow must compile to a branchall module"
+    assert branchall["value"].get("parallel") is True, (
+        "Branchall should run branches in parallel (parallel: true)."
+    )
