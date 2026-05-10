@@ -193,9 +193,9 @@ jobs:
           echo "WINDMILL_TOKEN=${{ steps.windmill_token.outputs.token }}" >> "$GITHUB_ENV"
           echo "WINDMILL_WORKSPACE=admins" >> "$GITHUB_ENV"
 
-      - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
+      - uses: Netflix/metaflow/.github/actions/run-ux-tests@master
         with:
-          metaflow-ref: npow/corral-devstack
+          metaflow-ref: master
           extra-install: "."
           use-sudo: "true"
           conda: "false"
