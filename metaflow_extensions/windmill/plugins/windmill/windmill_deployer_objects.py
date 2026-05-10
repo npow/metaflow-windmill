@@ -348,6 +348,15 @@ class WindmillDeployedFlow(DeployedFlow):
                 for k, v in info.items()
                 if k not in ("name", "flow_name", "flow_file")
             }
+            # The deployment id intentionally omits the windmill_token (see the
+            # `id` property's safe_info filter). Read it fresh from the
+            # environment so a recovered deployment can actually trigger jobs.
+            # Without this, _trigger_direct() sends an empty Authorization
+            # header and Windmill returns HTTP 401.
+            if not additional_info.get("windmill_token"):
+                token = os.environ.get("WINDMILL_TOKEN", "")
+                if token:
+                    additional_info["windmill_token"] = token
         else:
             # REQUIRED (Cap.FROM_DEPLOYMENT): handle dotted names.
             # If identifier already contains '/' it's a Windmill path — use as-is.
