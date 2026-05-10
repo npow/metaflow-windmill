@@ -182,18 +182,67 @@ class WindmillTriggeredRun(TriggeredRun):
 
         return "RUNNING"
 
+    def _query_windmill_status(self) -> Optional[str]:
+        """Ask the Windmill API for the job's terminal state, if we can.
+
+        Required because _check_sysroot_completion can't tell the difference
+        between "running" and "crashed before reaching end" — both leave the
+        end/ directory empty. Querying Windmill's job state directly avoids
+        the polling-forever failure mode.
+        """
+        job_id = self._metadata.get("job_id")
+        if not job_id:
+            return None
+        additional_info = getattr(self.deployer, "additional_info", {}) or {}
+        host = additional_info.get("windmill_host") or os.environ.get("WINDMILL_HOST")
+        token = additional_info.get("windmill_token") or os.environ.get("WINDMILL_TOKEN")
+        workspace = (
+            additional_info.get("windmill_workspace")
+            or os.environ.get("WINDMILL_WORKSPACE")
+            or "admins"
+        )
+        if not (host and token):
+            return None
+        try:
+            import requests
+            resp = requests.get(
+                f"{host}/api/w/{workspace}/jobs_u/get/{job_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            # Windmill: type == "CompletedJob" once the job reaches a terminal
+            # state (success or failure); anything else means still running.
+            if str(data.get("type", "")).lower() != "completedjob":
+                return "RUNNING"
+            return "SUCCEEDED" if data.get("success", False) else "FAILED"
+        except Exception:
+            return None
+
     @property
     def status(self) -> Optional[str]:
         """Return a status string for this run."""
         self._ensure_metadata()
         run = self.run
         if run is None:
-            return self._check_sysroot_completion() or "PENDING"
+            # Windmill API is the source of truth for terminal state. The
+            # filesystem-only fallback can't distinguish a crashed flow (no
+            # end/ dir) from a still-running flow (also no end/ dir).
+            return (
+                self._query_windmill_status()
+                or self._check_sysroot_completion()
+                or "PENDING"
+            )
         if run.successful:
             return "SUCCEEDED"
         if run.finished:
             return "FAILED"
-        return "RUNNING"
+        # Run object exists but isn't terminal — defer to Windmill, which
+        # owns workflow-level state (mid-flow crashes don't update
+        # run.finished because the end step never registers).
+        return self._query_windmill_status() or "RUNNING"
 
 
 class WindmillDeployedFlow(DeployedFlow):
