@@ -769,3 +769,128 @@ def test_conditional_split_compiles():
 
     # Join step emitted at top level after branchone
     assert "join" in module_ids, "join step should be at top level after branchone"
+
+
+def test_compiled_flow_omits_same_worker():
+    """Regression: compiled flows must not set ``same_worker: true``.
+
+    Windmill server rejects a flow that combines ``same_worker: true`` with any
+    ``parallel: true`` branchall module:
+      "Cannot continue on same worker with multiple jobs, parallel cannot be
+       used in conjunction with same_worker"
+    Run-ID propagation moved off /tmp onto input_transforms (PR #1), so we no
+    longer need same_worker — and keeping it would block any flow with a split.
+    """
+    from metaflow import FlowSpec, step
+
+    class TwoBranchFlow(FlowSpec):
+        @step
+        def start(self):
+            self.next(self.a, self.b)
+
+        @step
+        def a(self):
+            self.next(self.join)
+
+        @step
+        def b(self):
+            self.next(self.join)
+
+        @step
+        def join(self, inputs):
+            self.next(self.end)
+
+        @step
+        def end(self):
+            pass
+
+    compiler = _make_compiler(TwoBranchFlow)
+    flow_value = compiler.compile()["value"]
+    assert "same_worker" not in flow_value, (
+        "Compiled flow must not set same_worker — incompatible with parallel branchall."
+    )
+    # And the branchall actually has parallel: true (sanity)
+    branchall = next(
+        (m for m in flow_value["modules"] if m["value"].get("type") == "branchall"),
+        None,
+    )
+    assert branchall is not None, "Two-branch flow must compile to a branchall module"
+    assert branchall["value"].get("parallel") is True, (
+        "Branchall should run branches in parallel (parallel: true)."
+    )
+
+
+def test_nested_split_in_branch_emits_inner_join_inside_branch():
+    """Regression: when a branch contains a nested split, the inner join must
+    be a module INSIDE the outer branchall's branch (not at top level).
+
+    Catches the failure mode where _collect_branch_modules stopped at the FIRST
+    join it encountered, dropping the inner_join from branch_a's module list.
+    The Windmill runtime then errored at outer_join with:
+       "No completed attempts of the task was found for task
+        SplitInBranchFlow/<run>/inner_join/windmill-1"
+    """
+    from metaflow import FlowSpec, step
+
+    class NestedFlow(FlowSpec):
+        @step
+        def start(self):
+            self.next(self.branch_a, self.branch_b)
+
+        @step
+        def branch_a(self):
+            self.next(self.inner_x, self.inner_y)
+
+        @step
+        def inner_x(self):
+            self.next(self.inner_join)
+
+        @step
+        def inner_y(self):
+            self.next(self.inner_join)
+
+        @step
+        def inner_join(self, inputs):
+            self.next(self.outer_join)
+
+        @step
+        def branch_b(self):
+            self.next(self.outer_join)
+
+        @step
+        def outer_join(self, inputs):
+            self.next(self.end)
+
+        @step
+        def end(self):
+            pass
+
+    compiler = _make_compiler(NestedFlow)
+    modules = compiler.compile()["value"]["modules"]
+
+    # outer_join is at top level; inner_join is NOT.
+    top_ids = {m["id"] for m in modules}
+    assert "outer_join" in top_ids
+    assert "inner_join" not in top_ids, (
+        "inner_join must live inside branch_a's branchall branch, not at the top level."
+    )
+
+    # Find the outer branchall and its branch_a sub-branch.
+    outer = next(m for m in modules if m["value"].get("type") == "branchall")
+    branch_a = next(
+        b for b in outer["value"]["branches"]
+        if b["label"] == "branch_a"
+    )
+    branch_a_module_ids = [m["id"] for m in branch_a["modules"]]
+
+    # branch_a's branch must contain: branch_a (split header), an inner branchall,
+    # then inner_join — in that order.
+    assert "branch_a" in branch_a_module_ids
+    assert "inner_join" in branch_a_module_ids, (
+        "inner_join must be inside branch_a so its task artifact exists when "
+        "outer_join reads input paths."
+    )
+    assert any(
+        m["value"].get("type") == "branchall"
+        for m in branch_a["modules"]
+    ), "branch_a should contain a nested branchall for the inner_x/inner_y split"
