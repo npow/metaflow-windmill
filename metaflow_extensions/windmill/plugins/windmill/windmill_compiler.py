@@ -955,13 +955,56 @@ PYEOF
         }
 
     def _collect_branch_modules(self, step_name: str, out: list, visited: set):
-        """Collect modules for one branch of a parallel split until a join."""
+        """Collect modules for one branch of a parallel split until the OUTER join.
+
+        Branches can themselves contain nested splits / split-switches / foreaches
+        — e.g. ``start -> branch_a (split into inner_x, inner_y) -> outer_join``.
+        For those, we mirror the top-level layout from ``_visit_node``: emit the
+        split header step, then the nested branchall/branchone/foreach module,
+        then the inner join, then keep walking past the inner join until we hit
+        the outer join (which signals the end of this branch).
+        """
         if step_name in visited:
             return
         node = self.graph[step_name]
         if node.type == "join":
-            return
+            return  # outer join — caller emits it after the branchall
         visited.add(step_name)
+
+        if node.type == "split":
+            out.append(self._build_step_module(node))
+            out.append(self._build_parallel_module(node, visited))
+            inner_join = self._find_join_step(step_name)
+            if inner_join and inner_join not in visited:
+                visited.add(inner_join)
+                out.append(self._build_step_module(self.graph[inner_join]))
+                for next_step in self.graph[inner_join].out_funcs:
+                    self._collect_branch_modules(next_step, out, visited)
+            return
+
+        if node.type == "split-switch":
+            out.append(self._build_switch_step_module(node))
+            out.append(self._build_branchone_module(node, visited))
+            inner_join = self._find_join_step(step_name)
+            if inner_join and inner_join not in visited:
+                visited.add(inner_join)
+                out.append(self._build_step_module(self.graph[inner_join]))
+                for next_step in self.graph[inner_join].out_funcs:
+                    self._collect_branch_modules(next_step, out, visited)
+            return
+
+        if node.type == "foreach":
+            out.append(self._build_step_module(node))
+            out.append(self._build_foreach_module(node, visited))
+            inner_join = self._find_foreach_join(step_name)
+            if inner_join and inner_join not in visited:
+                visited.add(inner_join)
+                out.append(self._build_step_module(self.graph[inner_join]))
+                for next_step in self.graph[inner_join].out_funcs:
+                    self._collect_branch_modules(next_step, out, visited)
+            return
+
+        # Linear / start
         out.append(self._build_step_module(node))
         for next_step in node.out_funcs:
             self._collect_branch_modules(next_step, out, visited)
